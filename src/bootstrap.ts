@@ -33,12 +33,16 @@ export async function importGroups(
     // e.g. "UnreadAn admin approved your photo in Cape Town Adverts.12h": the
     // fixed scraper now reports "Cape Town Adverts" and it simply replaces it.
     //
+    // Except when a human typed the name: renaming a group in the Groups tab
+    // sets nameLocked (see store.groups.update), and a locked name is never
+    // touched here — re-running the import must not wipe hand edits. Clearing
+    // the lock (an explicit nameLocked: false patch) hands it back to us.
+    //
     // Belt and braces for discoverers other than ours: if the incoming name is
-    // itself junk, keep whatever is stored rather than saving it. There is no
-    // record of which names a human typed versus which came from a scrape, so
-    // "never overwrite a human edit" cannot be enforced here without a schema
-    // change; renames are best made on Facebook or redone after an import.
-    const name = cleanGroupName(g.name) ?? existing?.name ?? g.name;
+    // itself junk, keep whatever is stored rather than saving it.
+    const name = existing?.nameLocked
+      ? existing.name
+      : cleanGroupName(g.name) ?? existing?.name ?? g.name;
     const res = store.groups.upsertByFbId({
       fbGroupId: g.fbGroupId,
       name,
@@ -56,6 +60,9 @@ export async function importGroups(
       quarantinedUntil: existing?.quarantinedUntil ?? null,
       quarantineReason: existing?.quarantineReason ?? null,
       tags: existing?.tags ?? [],
+      // Stated rather than left to upsertByFbId's default so the intent is
+      // visible here: an import never locks a name, and never unlocks one.
+      nameLocked: existing?.nameLocked ?? false,
     });
     if (res.created) created++; else updated++;
   }

@@ -51,6 +51,7 @@ const toGroup = (r: Row): Group => ({
   quarantinedUntil: nul<string>(r.quarantined_until),
   quarantineReason: nul<string>(r.quarantine_reason),
   tags: json<string[]>(r.tags, []),
+  nameLocked: bool(r.name_locked),
   createdAt: String(r.created_at),
 });
 
@@ -198,9 +199,9 @@ export function openStore(dbPath: string): Store {
     fbGroupId: 'fb_group_id', name: 'name', url: 'url', memberCount: 'member_count',
     composerType: 'composer_type', active: 'active', cooldownDaysOverride: 'cooldown_days_override',
     rulesNotes: 'rules_notes', quarantinedUntil: 'quarantined_until',
-    quarantineReason: 'quarantine_reason', tags: 'tags',
+    quarantineReason: 'quarantine_reason', tags: 'tags', nameLocked: 'name_locked',
   };
-  const groupEnc = { active: b, tags: j };
+  const groupEnc = { active: b, tags: j, nameLocked: b };
 
   const groups: Store['groups'] = {
     list(opts) {
@@ -229,21 +230,35 @@ export function openStore(dbPath: string): Store {
     create(x: NewGroup) {
       const info = one(`INSERT INTO groups
         (fb_group_id, name, url, member_count, composer_type, active, cooldown_days_override,
-         rules_notes, quarantined_until, quarantine_reason, tags, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+         rules_notes, quarantined_until, quarantine_reason, tags, name_locked, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         x.fbGroupId, x.name, x.url, x.memberCount, x.composerType, b(x.active),
         x.cooldownDaysOverride, x.rulesNotes, x.quarantinedUntil, x.quarantineReason,
-        j(x.tags), now(),
+        j(x.tags), b(x.nameLocked ?? false), now(),
       );
       return groups.get(Number(info.lastInsertRowid))!;
     },
     upsertByFbId(x: NewGroup) {
       const existing = groups.getByFbId(x.fbGroupId);
       if (!existing) return { group: groups.create(x), created: true };
-      return { group: groups.update(existing.id, x), created: false };
+      // Pinning nameLocked explicitly stops update() from auto-locking: the
+      // importer's name is a scrape, not a human edit. Without this the first
+      // re-import would lock every group and freeze all names forever.
+      const patch = { ...x, nameLocked: x.nameLocked ?? existing.nameLocked };
+      return { group: groups.update(existing.id, patch), created: false };
     },
     update(id, patch) {
-      const { clause, vals } = buildSet(patch, groupCols, groupEnc);
+      // Every caller that sends `name` here is a person renaming a group in the
+      // Groups tab (PATCH /api/groups/:id and /bulk), so the name gets locked
+      // against the next import without the routes or UI knowing about it. An
+      // explicit nameLocked in the patch wins, which is how a name is unlocked
+      // (and how upsertByFbId opts out of the auto-lock).
+      // `nameLocked: undefined` counts as absent: buildSet keys off presence,
+      // and would otherwise encode undefined as 0 and silently unlock.
+      const { nameLocked, ...rest } = patch;
+      const lock = nameLocked ?? ('name' in patch ? true : undefined);
+      const effective = lock === undefined ? rest : { ...rest, nameLocked: lock };
+      const { clause, vals } = buildSet(effective, groupCols, groupEnc);
       if (clause) one(`UPDATE groups SET ${clause} WHERE id = ?`).run(...vals, id);
       const found = groups.get(id);
       if (!found) throw new Error(`group ${id} not found`);

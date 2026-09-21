@@ -46,6 +46,13 @@ export interface Group {
   quarantinedUntil: IsoDateTime | null;
   quarantineReason: string | null;
   tags: string[];
+  /**
+   * True once a human has typed this group's name: any groups.update whose
+   * patch carries `name` sets it. The importer never overwrites a locked name,
+   * so re-running the import cannot wipe hand edits. Only an explicit
+   * `nameLocked: false` patch clears it, handing the name back to the importer.
+   */
+  nameLocked: boolean;
   createdAt: IsoDateTime;
 }
 

@@ -70,6 +70,27 @@ const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 3,
+    name: 'group-name-lock',
+    up(db) {
+      // Re-running the group import refreshed every name from Facebook, which
+      // also wiped names typed by hand in the Groups tab — the database had no
+      // way to tell a scraped name from a human one. This flag records it.
+      //
+      // DEFAULT 0 on upgrade is deliberate: every existing name is treated as
+      // scraped, i.e. exactly how the importer already treated them, so the
+      // upgrade itself changes no behaviour. Names edited from here on lock.
+      //
+      // Added here rather than in schema.sql: fresh installs run migration 1
+      // then this one, and a column already present in the base schema would
+      // make this ALTER fail with "duplicate column name".
+      db.exec(`
+        ALTER TABLE groups ADD COLUMN name_locked INTEGER NOT NULL DEFAULT 0
+          CHECK (name_locked IN (0, 1));
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA_VERSION: number =

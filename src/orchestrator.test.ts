@@ -8,7 +8,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { openStore } from './store/sqlite-store.ts';
-import { createOrchestrator } from './orchestrator.ts';
+import {
+  createOrchestrator, GROUP_RESTRICTED_QUARANTINE_DAYS, WRONG_COMPOSER_QUARANTINE_DAYS,
+} from './orchestrator.ts';
+import { resultFromError } from './runner/playwright-runner.ts';
 import type { PostJob, PostResult, Runner, Store } from './domain/contracts.ts';
 import type { Id } from './domain/types.ts';
 
@@ -292,3 +295,110 @@ for (const kind of ['rate-limit', 'checkpoint', 'captcha', 'temporary-block', 'l
     });
   });
 }
+
+// --- quarantine: groups that will refuse every time ---------------------------
+
+const DAY = 24 * 60 * MIN;
+
+test('a group-level restriction quarantines the group and cancels its other queued posts', () => {
+  const { store, bizId, adId, variantId, groupIds } = fixture();
+  // Group 0 twice (as a later round would hold it), then groups 1 and 2.
+  const items = queueRound(store, {
+    bizId, adId, variantId, groupIds: [groupIds[0]!, groupIds[1]!, groupIds[0]!, groupIds[2]!],
+    startMs: START, gapMs: 7 * MIN, roundId: 'r1',
+  });
+
+  const clock = fakeClock(START);
+  const runner = scriptedRunner([
+    { outcome: 'blocked', blockKind: 'group-restricted', error: 'page said "only admins can post" (group-restricted)' },
+  ]);
+  const lines: string[] = [];
+  const orch = createOrchestrator({ store, runner, now: clock.now, sleep: clock.sleep, log: (m) => lines.push(m) });
+
+  return orch.runDue(4, 17 * MIN).then((summary) => {
+    assert.equal(store.settings.get().breakerTripped, false);
+    const g = store.groups.get(groupIds[0]!)!;
+    assert.ok(g.quarantinedUntil, 'the group must be quarantined');
+    assert.equal(Date.parse(g.quarantinedUntil) - START, GROUP_RESTRICTED_QUARANTINE_DAYS * DAY);
+    assert.match(g.quarantineReason ?? '', /only admins can post/, 'the reason must carry what Facebook said');
+
+    assert.equal(store.queue.get(items[2]!.id)?.status, 'cancelled', 'its second slot must not be attempted');
+    assert.deepEqual(runner.jobs.map((j) => j.group.id), [groupIds[0], groupIds[1], groupIds[2]]);
+    assert.equal(summary.posted, 2);
+    assert.equal(summary.failed, 1);
+    assert.ok(lines.some((l) => l.includes('QUARANTINED Group 0')), 'the quarantine must be logged');
+    store.close();
+  });
+});
+
+test('a buy-and-sell group set up as status is quarantined with a fix-it reason, breaker untouched', () => {
+  const { store, bizId, adId, variantId, groupIds } = fixture();
+  const items = queueRound(store, {
+    bizId, adId, variantId, groupIds: [groupIds[0]!, groupIds[1]!, groupIds[0]!],
+    startMs: START, gapMs: 7 * MIN, roundId: 'r1',
+  });
+
+  const clock = fakeClock(START);
+  // Exactly what the Playwright runner reports for composers.ts's ComposerError.
+  const runner = scriptedRunner([resultFromError(
+    'this group shows "Sell Something" but no "Write something…" composer — this looks like a '
+    + 'buy-and-sell group — set its composer type to "listing" (Marketplace) in the Groups tab',
+    'shot.png',
+  )]);
+  const orch = createOrchestrator({ store, runner, now: clock.now, sleep: clock.sleep, log: () => {} });
+
+  return orch.runDue(3, 17 * MIN).then((summary) => {
+    assert.equal(store.settings.get().breakerTripped, false, 'a config problem must not stop the account');
+    assert.equal(summary.failed, 1);
+    assert.equal(summary.posted, 1);
+    const g = store.groups.get(groupIds[0]!)!;
+    assert.equal(Date.parse(g.quarantinedUntil!) - START, WRONG_COMPOSER_QUARANTINE_DAYS * DAY);
+    assert.match(g.quarantineReason ?? '', /composer type to "listing" in the Groups tab/);
+    assert.equal(store.queue.get(items[0]!.id)?.status, 'failed');
+    assert.equal(store.queue.get(items[2]!.id)?.status, 'cancelled');
+    store.close();
+  });
+});
+
+test('an ordinary failure does not quarantine the group', () => {
+  const { store, bizId, adId, variantId, groupIds } = fixture();
+  queueRound(store, { bizId, adId, variantId, groupIds: groupIds.slice(0, 1), startMs: START, gapMs: 0, roundId: null });
+
+  const clock = fakeClock(START);
+  const runner = scriptedRunner([resultFromError('page.goto: Timeout 45000ms exceeded.')]);
+  const orch = createOrchestrator({ store, runner, now: clock.now, sleep: clock.sleep, log: () => {} });
+
+  return orch.runDue(1).then((summary) => {
+    assert.equal(summary.failed, 1);
+    assert.equal(store.groups.get(groupIds[0]!)!.quarantinedUntil, null);
+    store.close();
+  });
+});
+
+test('queued posts for a group quarantined mid-run are cancelled, not posted; expired quarantine is ignored', () => {
+  const { store, bizId, adId, variantId, groupIds } = fixture();
+  const items = queueRound(store, {
+    bizId, adId, variantId, groupIds: groupIds.slice(0, 2), startMs: START, gapMs: 0, roundId: null,
+  });
+  // Quarantined by a human after the plan was committed.
+  store.groups.update(groupIds[0]!, {
+    quarantinedUntil: new Date(START + DAY).toISOString(), quarantineReason: 'set by hand',
+  });
+  // An old quarantine that has run out must not keep the group out.
+  store.groups.update(groupIds[1]!, {
+    quarantinedUntil: new Date(START - DAY).toISOString(), quarantineReason: 'long ago',
+  });
+
+  const clock = fakeClock(START);
+  const runner = recordingRunner();
+  const orch = createOrchestrator({ store, runner, now: clock.now, sleep: clock.sleep, log: () => {} });
+
+  return orch.runDue(2).then((summary) => {
+    assert.deepEqual(runner.jobs.map((j) => j.group.id), [groupIds[1]]);
+    assert.equal(summary.posted, 1);
+    const cancelled = store.queue.get(items[0]!.id)!;
+    assert.equal(cancelled.status, 'cancelled');
+    assert.match(cancelled.lastError ?? '', /set by hand/);
+    store.close();
+  });
+});

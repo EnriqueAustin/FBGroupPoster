@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS groups (
   quarantine_reason      TEXT,
   tags                   TEXT    NOT NULL DEFAULT '[]',  -- JSON array of strings
   created_at             TEXT    NOT NULL
+  -- name_locked (0/1) is added by migration 3 in migrate.ts. It must NOT be
+  -- listed here: this file is migration 1, and the later ALTER would then fail
+  -- on fresh installs with a duplicate column.
 );
 
 CREATE INDEX IF NOT EXISTS idx_groups_active ON groups (active, composer_type);

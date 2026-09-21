@@ -13,7 +13,10 @@ import type {
 // Store
 // ---------------------------------------------------------------------------
 
-export type NewGroup = Omit<Group, 'id' | 'createdAt'>;
+// nameLocked is optional on input: nearly every create is a scraped group,
+// which starts unlocked, and on update the store derives the lock itself
+// (see groups.update) — so callers only mention it to unlock deliberately.
+export type NewGroup = Omit<Group, 'id' | 'createdAt' | 'nameLocked'> & { nameLocked?: boolean };
 export type NewBusiness = Omit<Business, 'id' | 'createdAt'>;
 export type NewAd = Omit<Ad, 'id' | 'createdAt'>;
 export type NewAdVariant = Omit<AdVariant, 'id' | 'createdAt'>;
@@ -33,8 +36,17 @@ export interface Store {
     get(id: Id): Group | null;
     getByFbId(fbGroupId: string): Group | null;
     create(g: NewGroup): Group;
-    /** Insert or update by fbGroupId. Used by the bootstrap importer. */
+    /**
+     * Insert or update by fbGroupId. Used by the bootstrap importer, so unlike
+     * update() it does NOT lock the name it writes: a scraped name is not a
+     * human edit. The existing lock is kept unless `nameLocked` is given.
+     */
     upsertByFbId(g: NewGroup): { group: Group; created: boolean };
+    /**
+     * Partial update. A patch that carries `name` also sets nameLocked = true
+     * (every caller of this is a human edit via the Groups tab), unless the
+     * patch states `nameLocked` explicitly — that is how a name is unlocked.
+     */
     update(id: Id, patch: Partial<NewGroup>): Group;
     assignments(businessId: Id): Id[];
     setAssignments(businessId: Id, groupIds: Id[]): void;

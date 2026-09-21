@@ -10,7 +10,9 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { PostJob, PostResult, Runner } from '../domain/contracts.ts';
 import { firstPage, launchBrowser, type RunnerBrowser } from './browser.ts';
-import { detectBlock, isAccountWide, type BlockResult } from './detect.ts';
+import {
+  detectBlock, isAccountWide, isWrongComposerMessage, WRONG_COMPOSER_TAG, type BlockResult,
+} from './detect.ts';
 import { composerFor, submitPost, waitForPageReady, ComposerError } from './composers.ts';
 
 export interface RunnerOptions {
@@ -83,6 +85,26 @@ export function resultAfterPosting(after: BlockResult, fbPostUrl: string): PostR
     error: after.reason ?? 'blocked after posting',
     detail: after.kind,
   };
+}
+
+/**
+ * What a thrown error means. Always 'failed' — an exception is never a block;
+ * blocks are only ever read off the page by detectBlock.
+ *
+ * Only the first line goes in `error`: messages can carry a long list of what
+ * the page offered, which belongs in the diagnostics file, not a table cell.
+ *
+ * The buy-and-sell ComposerError is tagged (WRONG_COMPOSER_TAG) so the
+ * orchestrator can tell "this group is misconfigured and will fail every
+ * time" from a transient failure. The whole message is searched, not just the
+ * first line, so the tag does not depend on where composers.ts puts its hint.
+ */
+export function resultFromError(message: string, screenshotPath?: string): PostResult {
+  const firstLine = message.split('\n')[0] ?? message;
+  if (isWrongComposerMessage(message)) {
+    return { outcome: 'failed', error: `${WRONG_COMPOSER_TAG}: ${firstLine}`, detail: screenshotPath };
+  }
+  return { outcome: 'failed', error: firstLine, detail: screenshotPath };
 }
 
 export function createRunner(opts: RunnerOptions = {}): Runner {
@@ -177,7 +199,7 @@ export function createRunner(opts: RunnerOptions = {}): Runner {
         } catch { /* diagnostics are best-effort */ }
 
         log(`    FAILED: ${message}`);
-        return { outcome: 'failed', error: message.split('\n')[0], detail: shot };
+        return resultFromError(message, shot);
       }
     },
 

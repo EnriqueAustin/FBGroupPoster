@@ -11,7 +11,42 @@ import type { Id, PostOutcome, QueueItem } from './domain/types.ts';
 // Pure policy function with no browser dependency (detect.ts only imports
 // Playwright's types). Imported rather than restated so "which blocks stop the
 // run" has exactly one definition.
-import { isAccountWide } from './runner/detect.ts';
+import { isAccountWide, isWrongComposerFailure } from './runner/detect.ts';
+
+const DAY_MS = 24 * 60 * 60_000;
+
+/**
+ * How long a group that refused us ("only admins can post", "you can't post
+ * in this group", removed from the group) is left out of planning.
+ *
+ * Two weeks because these are decisions by a group's admins, and those do not
+ * flip back overnight: a day or two would just re-plan the group into the same
+ * refusal, and each refusal is one more attempt Facebook sees. But they do
+ * change — posting days get reopened, a membership request gets approved — so
+ * it expires on its own rather than dropping the group for good. Anyone who
+ * knows better can clear it early in the Groups tab.
+ */
+export const GROUP_RESTRICTED_QUARANTINE_DAYS = 14;
+
+/**
+ * How long a group whose composer type is wrong (a buy-and-sell group set up
+ * as 'status') is left out of planning.
+ *
+ * This is not Facebook's decision and waiting will not fix it — only changing
+ * the composer type will. So the quarantine is not really a cool-off; it is a
+ * way to stop every round failing on the same group while the human has not
+ * yet looked. Shorter than the restriction case because a failure here costs
+ * nothing on Facebook's side (it fails before anything is typed), so if the
+ * fix is never made, being reminded weekly by one failed item is fine.
+ */
+export const WRONG_COMPOSER_QUARANTINE_DAYS = 7;
+
+/**
+ * Exported so the Groups route can recognise this particular quarantine and
+ * lift it the moment the composer type is changed — the one fix it asks for.
+ */
+export const WRONG_COMPOSER_QUARANTINE_REASON =
+  'This looks like a buy-and-sell group: set its composer type to "listing" in the Groups tab.';
 
 export interface OrchestratorOptions {
   store: Store;
@@ -129,6 +164,35 @@ export function createOrchestrator(opts: OrchestratorOptions) {
     return { queueItemId: item.id, group, ad, variant, mode };
   }
 
+  function isQuarantined(groupId: Id): boolean {
+    const until = store.groups.get(groupId)?.quarantinedUntil;
+    return !!until && Date.parse(until) > now().getTime();
+  }
+
+  /**
+   * Take a group out of planning, and out of what is already queued.
+   *
+   * The planner and the round builder both skip quarantined groups, which
+   * covers every FUTURE plan. It does not cover this run: a round queued this
+   * morning may hold the same group again this afternoon (or a drip plan may
+   * hold it tomorrow), and posting there would just get the same refusal. So
+   * its other waiting items are cancelled here rather than left to fail one by
+   * one. Cancelled, not deleted, so the queue view shows what happened.
+   */
+  function quarantineGroup(groupId: Id, groupName: string, days: number, reason: string): void {
+    const until = new Date(now().getTime() + days * DAY_MS).toISOString();
+    store.groups.update(groupId, { quarantinedUntil: until, quarantineReason: reason });
+
+    const waiting = store.queue.list({ status: ['pending', 'due'] }).filter((q) => q.groupId === groupId);
+    for (const q of waiting) {
+      store.queue.update(q.id, { status: 'cancelled', lastError: `group quarantined: ${reason}` });
+    }
+
+    log(`    QUARANTINED ${groupName} for ${days} days (until ${new Date(until).toLocaleDateString()}): ${reason}`);
+    if (waiting.length) log(`    cancelled ${waiting.length} other queued post(s) for this group`);
+    log('    It will not be planned again until then. Clear it early in the Groups tab if this is wrong.');
+  }
+
   function record(item: QueueItem, outcome: PostOutcome, extra: { fbPostUrl?: string; error?: string; detail?: string }): void {
     store.log.append({
       queueItemId: item.id,
@@ -213,6 +277,16 @@ export function createOrchestrator(opts: OrchestratorOptions) {
           break;
         }
 
+        // Items queued before their group was quarantined — by this run
+        // (quarantineGroup cancels those, but this is the backstop) or by a
+        // human in the Groups tab mid-run. The planner would not have planned
+        // them now, so they must not be posted either.
+        if (isQuarantined(item.groupId)) {
+          const reason = store.groups.get(item.groupId)?.quarantineReason ?? 'no reason recorded';
+          store.queue.update(item.id, { status: 'cancelled', lastError: `group quarantined: ${reason}` });
+          continue;
+        }
+
         const job = hydrate(item);
         if (!job) {
           store.queue.update(item.id, { status: 'cancelled', lastError: 'referenced group/ad/variant no longer exists' });
@@ -233,7 +307,20 @@ export function createOrchestrator(opts: OrchestratorOptions) {
         if (result.outcome === 'failed' && result.blockKind) {
           log(`    ${job.group.name} refused the post (${result.blockKind}) — moving on; the breaker is NOT tripped`);
         }
+        // Record first, so the history row exists before the group vanishes
+        // from planning — the history is where a human goes to find out why.
         record(item, result.outcome, result);
+
+        // Both cases below are about this group only: neither trips the
+        // breaker, and both would fail the same way on every retry.
+        if (result.outcome === 'failed' && result.blockKind === 'group-restricted') {
+          quarantineGroup(job.group.id, job.group.name, GROUP_RESTRICTED_QUARANTINE_DAYS,
+            `Facebook refused posts in this group: ${result.error ?? 'group-restricted'}`);
+        } else if (isWrongComposerFailure(result)) {
+          log(`    ${job.group.name} is set up with the wrong composer type — the breaker is NOT tripped`);
+          quarantineGroup(job.group.id, job.group.name, WRONG_COMPOSER_QUARANTINE_DAYS,
+            WRONG_COMPOSER_QUARANTINE_REASON);
+        }
 
         switch (result.outcome) {
           case 'posted':

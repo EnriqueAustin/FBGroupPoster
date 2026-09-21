@@ -7,14 +7,17 @@ import { z } from 'zod';
 import { writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import type { Scheduler, Store } from '../domain/contracts.ts';
-import { badRequest, must, parseBody, parseParams, parseQuery, sendError } from './http.ts';
+import { badRequest, must, parseBody, parseOr400, parseParams, parseQuery, sendError } from './http.ts';
 import { createJobRunner } from './jobs.ts';
 import { importGroups } from '../bootstrap.ts';
 import { createGroupDiscoverer } from '../runner/discover-groups.ts';
 import { createRunner } from '../runner/playwright-runner.ts';
-import { createOrchestrator } from '../orchestrator.ts';
+import { createOrchestrator, WRONG_COMPOSER_QUARANTINE_REASON } from '../orchestrator.ts';
 import { commitRound, planRound } from '../scheduler/rounds.ts';
 import { startOfDayUtcMs, toIso } from '../scheduler/time.ts';
+import {
+  DEFAULT_DIAGNOSTICS_DAYS, deleteMediaFiles, findOldDiagnostics, findUnusedMedia, referencedImagePaths,
+} from './media-gc.ts';
 
 const idParam = z.object({ id: z.coerce.number().int().positive() });
 const composerType = z.enum(['status', 'listing']);
@@ -34,6 +37,11 @@ const groupPatch = z.object({
   quarantinedUntil: z.string().datetime().nullable().optional(),
   quarantineReason: z.string().nullable().optional(),
   tags: z.array(z.string()).optional(),
+  /**
+   * Renaming a group locks its name against re-import automatically (see the
+   * store). This is the way back: false hands the name to the importer again.
+   */
+  nameLocked: z.boolean().optional(),
 });
 
 /** With ~100 groups, curating one row at a time is unusable. */
@@ -94,7 +102,24 @@ const planQuery = z.object({
 
 export const MEDIA_DIR = path.join('data', 'media');
 
-export function registerRoutes(app: FastifyInstance, store: Store, scheduler: Scheduler): void {
+export interface RouteOptions {
+  /** Where uploads live. Overridable so tests never touch the real data/media. */
+  mediaDir?: string;
+}
+
+const cleanupBody = z.object({
+  includeDiagnostics: z.boolean().default(false),
+  diagnosticsOlderThanDays: z.number().int().min(1).max(3650).default(DEFAULT_DIAGNOSTICS_DAYS),
+});
+
+const unusedQuery = z.object({
+  diagnosticsOlderThanDays: z.coerce.number().int().min(1).max(3650).default(DEFAULT_DIAGNOSTICS_DAYS),
+});
+
+export function registerRoutes(
+  app: FastifyInstance, store: Store, scheduler: Scheduler, opts: RouteOptions = {},
+): void {
+  const mediaDir = opts.mediaDir ?? MEDIA_DIR;
   app.setErrorHandler((err, _req, reply) => { sendError(reply, err); });
 
   // --- businesses ------------------------------------------------------------
@@ -118,18 +143,33 @@ export function registerRoutes(app: FastifyInstance, store: Store, scheduler: Sc
     return store.groups.list(q);
   });
 
+  /**
+   * Apply a group patch, lifting a wrong-composer quarantine when the composer
+   * type is changed. That quarantine exists only to stop rounds failing on a
+   * misconfigured group; once the type is fixed, making the user also find and
+   * clear the quarantine is a second step nobody remembers. Only that exact
+   * quarantine is lifted — one Facebook imposed (a restriction) is kept, and an
+   * explicit quarantine field in the same patch always wins.
+   */
+  const updateGroup = (id: number, patch: z.infer<typeof groupPatch>) => {
+    const existing = must(store.groups.get(id), `group ${id}`);
+    const fixesComposer = patch.composerType !== undefined
+      && patch.composerType !== existing.composerType
+      && existing.quarantineReason === WRONG_COMPOSER_QUARANTINE_REASON
+      && patch.quarantinedUntil === undefined && patch.quarantineReason === undefined;
+    return store.groups.update(id, fixesComposer
+      ? { ...patch, quarantinedUntil: null, quarantineReason: null }
+      : patch);
+  };
+
   app.patch('/api/groups/:id', (req) => {
     const { id } = parseParams(idParam, req);
-    must(store.groups.get(id), 'group');
-    return store.groups.update(id, parseBody(groupPatch, req));
+    return updateGroup(id, parseBody(groupPatch, req));
   });
 
   app.post('/api/groups/bulk', (req) => {
     const { ids, patch } = parseBody(bulkBody, req);
-    return ids.map((id) => {
-      must(store.groups.get(id), `group ${id}`);
-      return store.groups.update(id, patch);
-    });
+    return ids.map((id) => updateGroup(id, patch));
   });
 
   app.get('/api/businesses/:id/assignments', (req) => {
@@ -183,11 +223,11 @@ export function registerRoutes(app: FastifyInstance, store: Store, scheduler: Sc
   app.post('/api/media', async (req) => {
     const file = await (req as unknown as { file(): Promise<{ filename: string; toBuffer(): Promise<Buffer> } | undefined> }).file();
     if (!file) throw badRequest('no file in the request');
-    await mkdir(MEDIA_DIR, { recursive: true });
+    await mkdir(mediaDir, { recursive: true });
     // Prefix with a timestamp so re-uploading the same filename never silently
     // replaces an image an existing variant still points at.
     const safe = file.filename.replace(/[^\w.\-]/g, '_');
-    const rel = path.join(MEDIA_DIR, `${Date.now()}-${safe}`);
+    const rel = path.join(mediaDir, `${Date.now()}-${safe}`);
     await writeFile(rel, await file.toBuffer());
     return { path: rel };
   });
@@ -486,6 +526,49 @@ export function registerRoutes(app: FastifyInstance, store: Store, scheduler: Sc
   app.post('/api/jobs/:id/cancel', (req) => {
     const id = String((req.params as { id: string }).id);
     return jobs.cancel(id);
+  });
+
+  // --- media cleanup ---------------------------------------------------------
+  /**
+   * Uploads are never overwritten (see POST /api/media), so re-saving an ad
+   * leaves its previous copies behind. These two endpoints sweep them.
+   *
+   * GET is a pure dry run so the UI can show what WOULD go before asking. The
+   * POST recomputes the list itself instead of accepting paths from the page:
+   * the only thing a caller can influence is whether diagnostics are included
+   * and how old they must be, never which file names are unlinked.
+   */
+  const sumBytes = (xs: Array<{ bytes: number }>) => xs.reduce((n, f) => n + f.bytes, 0);
+
+  app.get('/api/media/unused', async (req) => {
+    const { diagnosticsOlderThanDays } = parseQuery(unusedQuery, req);
+    const files = await findUnusedMedia({ mediaDir, referenced: referencedImagePaths(store) });
+    const diagnostics = await findOldDiagnostics({ mediaDir, olderThanDays: diagnosticsOlderThanDays });
+    return {
+      files, diagnostics, diagnosticsOlderThanDays,
+      unusedBytes: sumBytes(files), diagnosticsBytes: sumBytes(diagnostics),
+      totalBytes: sumBytes(files) + sumBytes(diagnostics),
+    };
+  });
+
+  app.post('/api/media/cleanup', async (req) => {
+    // A bodyless POST means "defaults", not a 400.
+    const { includeDiagnostics, diagnosticsOlderThanDays } = parseOr400(cleanupBody, req.body ?? {}, 'body');
+    // A running post job reads variant images from disk as it goes. The
+    // reference check and upload grace period should already protect those,
+    // but a sweep mid-run is the one moment a mistake here costs a real post.
+    if (jobs.current()) throw badRequest('a job is running — wait for it to finish before cleaning up media');
+    const images = await deleteMediaFiles(mediaDir,
+      await findUnusedMedia({ mediaDir, referenced: referencedImagePaths(store) }));
+    const diagnostics = includeDiagnostics
+      ? await deleteMediaFiles(mediaDir, await findOldDiagnostics({ mediaDir, olderThanDays: diagnosticsOlderThanDays }))
+      : { deleted: 0, bytes: 0, skipped: [] as string[] };
+    return {
+      deletedFiles: images.deleted,
+      deletedDiagnostics: diagnostics.deleted,
+      bytesFreed: images.bytes + diagnostics.bytes,
+      skipped: [...images.skipped, ...diagnostics.skipped],
+    };
   });
 
   // --- summary for the dashboard --------------------------------------------

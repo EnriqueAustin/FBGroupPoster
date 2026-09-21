@@ -108,10 +108,38 @@ export interface BlockResult {
   reason?: string;
 }
 
-/** Pure matcher, so the patterns can be tested without a browser. */
-export function matchBlock(url: string, visibleText: string): BlockResult {
+/**
+ * The kinds that text from a role="status" region is allowed to signal.
+ *
+ * Facebook shows some notices as toasts in a status live region — "your post
+ * is pending approval" among them — and those are missed if only dialogs and
+ * alerts are read. But status regions also carry generic chatter that has
+ * nothing to do with posting: "Couldn't load comments. Try again later.",
+ * upload progress, screen-reader announcements. Letting that text reach the
+ * account-wide patterns would trip the (sticky) breaker on a flaky-network
+ * toast — "try again later" is literally a rate-limit fragment. Letting it
+ * reach 'group-restricted' would quarantine a group for weeks on the same
+ * kind of noise. The one kind that is both what we want from these toasts and
+ * cheap to get wrong is 'pending-approval': a false match there at worst
+ * records as posted a post we already believed had gone out.
+ *
+ * This deliberately bends the "bias towards false positives" rule at the top
+ * of this file. That rule is about never MISSING a real block, and real blocks
+ * are shown in dialogs or on full-page screens, which are still read in full.
+ */
+export const STATUS_REGION_KINDS: ReadonlySet<BlockKind> = new Set<BlockKind>(['pending-approval']);
+
+/**
+ * Pure matcher, so the patterns can be tested without a browser.
+ *
+ * `statusText` is text from role="status" regions; it is matched only against
+ * STATUS_REGION_KINDS. Signal order still decides the winner across both, so a
+ * real block in `visibleText` always beats a status toast.
+ */
+export function matchBlock(url: string, visibleText: string, statusText = ''): BlockResult {
   const u = url.toLowerCase();
   const t = visibleText.toLowerCase();
+  const st = statusText.toLowerCase();
 
   for (const signal of BLOCK_SIGNALS) {
     for (const fragment of signal.url ?? []) {
@@ -122,6 +150,9 @@ export function matchBlock(url: string, visibleText: string): BlockResult {
     for (const fragment of signal.text ?? []) {
       if (t.includes(fragment)) {
         return { blocked: true, kind: signal.kind, reason: `page said "${fragment}" (${signal.kind})` };
+      }
+      if (st && STATUS_REGION_KINDS.has(signal.kind) && st.includes(fragment)) {
+        return { blocked: true, kind: signal.kind, reason: `status toast said "${fragment}" (${signal.kind})` };
       }
     }
   }
@@ -146,10 +177,43 @@ export function isAccountWide(kind: BlockKind): boolean {
     || kind === 'rate-limit' || kind === 'login-required';
 }
 
+/**
+ * A different kind of refusal: not Facebook pushing back, but the group being
+ * set up with the wrong composer type. The status composer fails fast with a
+ * ComposerError whose hint says the group "looks like a buy-and-sell group"
+ * (see findStatusOpener in composers.ts). That will fail identically on every
+ * attempt until a human changes the group's composer type, so the orchestrator
+ * must quarantine the group rather than keep burning queue items on it.
+ *
+ * PostResult has no field for this (it is a domain contract), so the runner
+ * prefixes the error with this tag. The tag is ours and stable; the phrase
+ * after it is composers.ts's wording and is only matched as a fallback, so a
+ * runner that forgets the tag is still recognised.
+ */
+export const WRONG_COMPOSER_TAG = 'wrong-composer-type';
+const WRONG_COMPOSER_PHRASE = 'looks like a buy-and-sell group';
+
+/** Whether an error message is the buy-and-sell-group ComposerError. */
+export function isWrongComposerMessage(message: string): boolean {
+  return message.toLowerCase().includes(WRONG_COMPOSER_PHRASE);
+}
+
+/** Whether a runner result is the wrong-composer-type failure. */
+export function isWrongComposerFailure(r: { outcome: string; error?: string }): boolean {
+  if (r.outcome !== 'failed' || !r.error) return false;
+  return r.error.startsWith(`${WRONG_COMPOSER_TAG}:`) || isWrongComposerMessage(r.error);
+}
+
 /** Raw material gathered from the live page; see gatherBlockSurfaces. */
 export interface BlockSurfaces {
   /** innerText of every dialog / alertdialog / alert on the page. */
   overlayTexts: string[];
+  /**
+   * innerText of every role="status" region (toasts). Kept apart from
+   * overlayTexts because it may only signal STATUS_REGION_KINDS. Optional so
+   * callers that predate it (and tests) need not supply it.
+   */
+  statusTexts?: string[];
   /** Whether the page has a [role="feed"], i.e. is a feed of members' posts. */
   hasFeed: boolean;
   /** document.body.innerText. Only used when there is no feed. */
@@ -177,15 +241,24 @@ export function selectBlockText(s: BlockSurfaces): string {
   return parts.join('\n');
 }
 
+/** Text from role="status" regions, for matchBlock's restricted channel. */
+export function selectStatusText(s: BlockSurfaces): string {
+  return (s.statusTexts ?? []).join('\n');
+}
+
 /** Runs in the browser. Collects the surfaces selectBlockText chooses from. */
 async function gatherBlockSurfaces(page: Page): Promise<BlockSurfaces> {
   return page.evaluate(() => {
     const overlays = Array.from(
       document.querySelectorAll<HTMLElement>('[role="dialog"], [role="alertdialog"], [role="alert"]'),
     );
+    // Toasts. Read regardless of the feed: a status region is Facebook's own
+    // UI, not members' posts. See STATUS_REGION_KINDS for what it may signal.
+    const statuses = Array.from(document.querySelectorAll<HTMLElement>('[role="status"]'));
     const hasFeed = document.querySelector('[role="feed"]') !== null;
     return {
       overlayTexts: overlays.map((el) => el.innerText ?? ''),
+      statusTexts: statuses.map((el) => el.innerText ?? ''),
       hasFeed,
       // Skip the (large) body read when it would be thrown away anyway.
       bodyText: hasFeed ? '' : (document.body?.innerText ?? ''),
@@ -203,5 +276,5 @@ export async function detectBlock(page: Page): Promise<BlockResult> {
     // happen, and the URL is still readable.
     return matchBlock(page.url(), '');
   }
-  return matchBlock(page.url(), selectBlockText(surfaces));
+  return matchBlock(page.url(), selectBlockText(surfaces), selectStatusText(surfaces));
 }

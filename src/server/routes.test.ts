@@ -9,6 +9,7 @@ import Fastify from 'fastify';
 import { openStore } from '../store/sqlite-store.ts';
 import { createScheduler } from '../scheduler/planner.ts';
 import { registerRoutes } from './routes.ts';
+import { WRONG_COMPOSER_QUARANTINE_REASON } from '../orchestrator.ts';
 import { startOfDayUtcMs } from '../scheduler/time.ts';
 import type { Store } from '../domain/contracts.ts';
 
@@ -375,5 +376,106 @@ test('log delete by id demands confirmPosted only when a posted row is included'
   });
   assert.equal(json(confirmed).deleted, 1);
   assert.equal(store.log.list().length, 0);
+  store.close();
+});
+
+test('media unused is a dry run; cleanup deletes only unreferenced files and old diagnostics', async () => {
+  // A temp media dir — these routes must never be pointed at the real data/media in tests.
+  const { mkdtempSync, mkdirSync, writeFileSync, existsSync, utimesSync, rmSync } = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const root = mkdtempSync(path.join(os.tmpdir(), 'routes-media-'));
+  const mediaDir = path.join(root, 'media');
+  mkdirSync(path.join(mediaDir, 'diagnostics'), { recursive: true });
+  const put = (rel: string, body: string, ageDays: number) => {
+    const full = path.join(mediaDir, rel);
+    writeFileSync(full, body);
+    const t = new Date(Date.now() - ageDays * 86_400_000);
+    utimesSync(full, t, t);
+    return full;
+  };
+
+  const store = openStore(':memory:');
+  const app = Fastify();
+  registerRoutes(app, store, createScheduler(store), { mediaDir });
+  try {
+    const kept = put('1-kept.png', 'kk', 2);
+    put('2-orphan.png', 'ooo', 2);
+    put(path.join('diagnostics', 'old.png'), 'dddd', 60);
+    put(path.join('diagnostics', 'new.png'), 'n', 1);
+
+    const biz = store.businesses.create({ name: 'Acme', active: true, dailyCapShare: null });
+    const ad = store.ads.create({ businessId: biz.id, name: 'A', composerType: 'status', active: true });
+    store.ads.createVariant({
+      adId: ad.id, caption: 'c', listingTitle: null, listingPriceCents: null, listingCategory: null,
+      listingLocation: null, imagePaths: [kept], weight: 1, active: false,
+    });
+
+    const dry = await app.inject({ method: 'GET', url: '/api/media/unused' });
+    assert.equal(dry.statusCode, 200);
+    const d = json(dry);
+    assert.deepEqual(d.files.map((f: { path: string }) => path.basename(f.path)), ['2-orphan.png']);
+    assert.deepEqual(d.diagnostics.map((f: { path: string }) => path.basename(f.path)), ['old.png']);
+    assert.equal(d.totalBytes, 7);
+    assert.ok(existsSync(path.join(mediaDir, '2-orphan.png')), 'the dry run must not delete');
+
+    // Without includeDiagnostics only images go.
+    const first = json(await app.inject({ method: 'POST', url: '/api/media/cleanup', payload: {} }));
+    assert.equal(first.deletedFiles, 1);
+    assert.equal(first.deletedDiagnostics, 0);
+    assert.equal(first.bytesFreed, 3);
+    assert.ok(existsSync(kept), 'an image an inactive variant references is kept');
+    assert.ok(existsSync(path.join(mediaDir, 'diagnostics', 'old.png')));
+
+    const second = json(await app.inject({
+      method: 'POST', url: '/api/media/cleanup', payload: { includeDiagnostics: true },
+    }));
+    assert.equal(second.deletedDiagnostics, 1);
+    assert.ok(existsSync(path.join(mediaDir, 'diagnostics', 'new.png')));
+
+    const bad = await app.inject({
+      method: 'POST', url: '/api/media/cleanup', payload: { diagnosticsOlderThanDays: 0 },
+    });
+    assert.equal(bad.statusCode, 400);
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('changing composer type lifts a wrong-composer quarantine but keeps a Facebook one', async () => {
+  const { app, store } = build();
+  const until = new Date(Date.now() + 7 * 86_400_000).toISOString();
+  const mk = (n: number, reason: string) => store.groups.create({
+    fbGroupId: `q${n}`, name: `Q${n}`, url: 'u', memberCount: null, composerType: 'status',
+    active: true, cooldownDaysOverride: null, rulesNotes: '', quarantinedUntil: until,
+    quarantineReason: reason, tags: [],
+  }).id;
+  const wrong = mk(1, WRONG_COMPOSER_QUARANTINE_REASON);
+  const refused = mk(2, 'Facebook refused posts in this group: only admins can post');
+
+  const res = await app.inject({
+    method: 'POST', url: '/api/groups/bulk',
+    payload: { ids: [wrong, refused], patch: { composerType: 'listing' } },
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(store.groups.get(wrong)?.quarantinedUntil, null, 'the fix it asked for should lift it');
+  assert.equal(store.groups.get(wrong)?.quarantineReason, null);
+  assert.equal(store.groups.get(refused)?.quarantinedUntil, until, 'a Facebook restriction must stay');
+  store.close();
+});
+
+test('a group name can be unlocked through the API', async () => {
+  const { app, store } = build();
+  const id = store.groups.create({
+    fbGroupId: 'n1', name: 'Scraped', url: 'u', memberCount: null, composerType: 'status',
+    active: true, cooldownDaysOverride: null, rulesNotes: '', quarantinedUntil: null,
+    quarantineReason: null, tags: [],
+  }).id;
+
+  await app.inject({ method: 'PATCH', url: `/api/groups/${id}`, payload: { name: 'Mine' } });
+  assert.equal(store.groups.get(id)?.nameLocked, true, 'renaming locks');
+  await app.inject({ method: 'PATCH', url: `/api/groups/${id}`, payload: { nameLocked: false } });
+  assert.equal(store.groups.get(id)?.nameLocked, false, 'nameLocked:false must survive validation');
   store.close();
 });

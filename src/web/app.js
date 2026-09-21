@@ -1517,10 +1517,77 @@ function viewSettings() {
           num('roundDailyCap', 1, 500, { placeholder: 'No limit' }), roundCapNote)),
     ),
     bar,
+    storageSection(),
   );
   original = JSON.stringify(read());
   settingsDraft = { dirty };
   sync();
+}
+
+const fmtBytes = (n) => n < 1024 ? `${n} B`
+  : n < 1024 ** 2 ? `${(n / 1024).toFixed(1)} KB`
+    : n < 1024 ** 3 ? `${(n / 1024 ** 2).toFixed(1)} MB` : `${(n / 1024 ** 3).toFixed(2)} GB`;
+
+/**
+ * Storage: sweep uploads no variant references any more.
+ *
+ * Every save of an ad re-uploads its images under a new timestamped name, so
+ * data/media grows with copies nothing points at. Its own card, outside the
+ * Safety form: it acts immediately rather than through Save, so it must not
+ * look like one of the draft fields the save bar tracks.
+ *
+ * Numbers come from the server's dry run and the confirm repeats them; the
+ * cleanup itself recomputes the list server-side, so what the page shows can
+ * only ever be an over-estimate of what gets deleted, never an instruction.
+ */
+function storageSection() {
+  const body = el('div', {}, el('p', { class: 'dim small' }, 'Checking unused images…'));
+  const sec = el('section', { class: 'card mt3' },
+    el('div', { class: 'settings-sec' },
+      el('div', {}, el('h2', {}, 'Storage'), el('div', { class: 'desc' },
+        el('p', {}, 'Re-saving an ad uploads its images again, so old copies pile up in data/media. Images any variant still uses — including paused ones — are never touched, nor is anything uploaded in the last hour.'),
+        el('p', {}, 'Failure screenshots in data/media/diagnostics can be cleared too once they are more than 30 days old.'))),
+      body));
+
+  async function load() {
+    let d;
+    try { d = await get('/api/media/unused'); } catch (err) {
+      body.replaceChildren(callout('bad', 'Could not check storage.', err.message));
+      return;
+    }
+    const nFiles = d.files.length, nDiag = d.diagnostics.length;
+    const incl = el('input', { type: 'checkbox', checked: nDiag > 0, disabled: nDiag === 0 });
+
+    const clean = async () => {
+      const withDiag = incl.checked && nDiag > 0;
+      const count = nFiles + (withDiag ? nDiag : 0);
+      const bytes = d.unusedBytes + (withDiag ? d.diagnosticsBytes : 0);
+      const ok = await confirmDialog('Delete unused files?',
+        `This permanently deletes ${plural(nFiles, 'unused image')}` +
+        (withDiag ? ` and ${plural(nDiag, 'old diagnostics file')}` : '') +
+        ` (${plural(count, 'file')}, ${fmtBytes(bytes)}). Images used by any ad variant are kept.`,
+        `Delete ${plural(count, 'file')}`, 'danger');
+      if (!ok) return;
+      const r = await post('/api/media/cleanup', { includeDiagnostics: withDiag });
+      const done = r.deletedFiles + r.deletedDiagnostics;
+      flash(`Deleted ${plural(done, 'file')}, freed ${fmtBytes(r.bytesFreed)}.` +
+        (r.skipped.length ? ` ${plural(r.skipped.length, 'file')} could not be removed (in use?).` : ''),
+      r.skipped.length ? 'info' : 'ok');
+      await load();
+    };
+
+    body.replaceChildren(
+      el('div', { class: 'row' },
+        el('span', {}, el('b', {}, plural(nFiles, 'unused image')), ` · ${fmtBytes(d.unusedBytes)}`)),
+      el('div', { class: 'row small dim', style: 'margin-top:6px' },
+        `${plural(nDiag, 'diagnostics file')} older than ${d.diagnosticsOlderThanDays} days · ${fmtBytes(d.diagnosticsBytes)}`),
+      el('label', { class: 'row small', style: 'margin-top:10px' }, incl, 'Include old diagnostics'),
+      el('div', { class: 'row', style: 'margin-top:12px' },
+        btn('Clean up', clean, { kind: 'danger-outline', size: 'sm', icon: 'trash', disabled: nFiles + nDiag === 0 }),
+        btn('Recheck', load, { kind: 'ghost', size: 'sm', icon: 'rotate' })));
+  }
+  load();
+  return sec;
 }
 
 // ----------------------------------------------------------------- rounds ---

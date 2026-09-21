@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import Database from 'better-sqlite3';
 import { openStore } from './sqlite-store.ts';
+import { LATEST_SCHEMA_VERSION, migrate } from './migrate.ts';
 import type { Store } from '../domain/contracts.ts';
 
 function fixture(): { store: Store; businessId: number; groupId: number; adId: number; variantId: number } {
@@ -313,5 +319,78 @@ test('countIdsWithOutcome checks only the given ids', () => {
   assert.equal(store.log.countIdsWithOutcome([failed.id], 'posted'), 0);
   assert.equal(store.log.countIdsWithOutcome([failed.id, posted.id, 9999], 'posted'), 1);
   assert.equal(store.log.countIdsWithOutcome([], 'posted'), 0);
+  store.close();
+});
+
+// --- group name lock ---------------------------------------------------------
+
+test('migration upgrades an old-schema database: existing groups arrive unlocked', () => {
+  // A real file, not :memory:, because the point is a database that was
+  // created and closed by an older build and is later opened by this one.
+  const dir = mkdtempSync(join(tmpdir(), 'fbgp-migrate-'));
+  const file = join(dir, 'old.db');
+  try {
+    // Build a version-1 database exactly as the first release did: the base
+    // schema, recorded as applied, with a group in it and no name_locked.
+    const schema = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'schema.sql'), 'utf8');
+    const old = new Database(file);
+    old.exec(schema);
+    old.exec(`CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);
+      INSERT INTO schema_version VALUES (1, 'base-schema', '2026-01-01T00:00:00.000Z');
+      INSERT INTO groups (fb_group_id, name, url, composer_type, created_at)
+        VALUES ('55', 'Old Group', 'u', 'status', '2026-01-01T00:00:00.000Z');`);
+    const cols = (old.prepare('PRAGMA table_info(groups)').all() as { name: string }[]).map((c) => c.name);
+    assert.ok(!cols.includes('name_locked'), 'fixture must really be the old shape');
+    old.close();
+
+    const store = openStore(file);
+    const g = store.groups.getByFbId('55')!;
+    assert.equal(g.name, 'Old Group', 'data must survive the upgrade');
+    assert.equal(g.nameLocked, false, 'pre-existing names are treated as scraped');
+    // And the new column is usable straight away.
+    assert.equal(store.groups.update(g.id, { name: 'Mine' }).nameLocked, true);
+    store.close();
+
+    const reopened = new Database(file);
+    const v = reopened.prepare('SELECT MAX(version) AS v FROM schema_version').get() as { v: number };
+    assert.equal(v.v, LATEST_SCHEMA_VERSION);
+    assert.deepEqual(migrate(reopened), [], 'second run must be a no-op');
+    reopened.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('new groups start unlocked; renaming one locks it', () => {
+  const { store, groupId } = fixture();
+  assert.equal(store.groups.get(groupId)!.nameLocked, false);
+  // An unrelated patch must not lock.
+  assert.equal(store.groups.update(groupId, { active: false }).nameLocked, false);
+  const renamed = store.groups.update(groupId, { name: 'My Name' });
+  assert.equal(renamed.name, 'My Name');
+  assert.equal(renamed.nameLocked, true);
+  // Later unrelated patches keep the lock.
+  assert.equal(store.groups.update(groupId, { active: true }).nameLocked, true);
+  store.close();
+});
+
+test('an explicit nameLocked patch wins, which is how a name is unlocked', () => {
+  const { store, groupId } = fixture();
+  store.groups.update(groupId, { name: 'My Name' });
+  assert.equal(store.groups.update(groupId, { nameLocked: false }).nameLocked, false);
+  assert.equal(store.groups.update(groupId, { name: 'X', nameLocked: false }).nameLocked, false);
+  // undefined is "not mentioned", not "false".
+  store.groups.update(groupId, { nameLocked: true });
+  assert.equal(store.groups.update(groupId, { active: true, nameLocked: undefined }).nameLocked, true);
+  store.close();
+});
+
+test('upsertByFbId neither locks nor unlocks the name', () => {
+  const { store, groupId } = fixture();
+  const g = store.groups.get(groupId)!;
+  const { nameLocked: _ignored, id: _id, createdAt: _c, ...asNew } = g;
+  assert.equal(store.groups.upsertByFbId({ ...asNew, name: 'Scraped' }).group.nameLocked, false);
+  store.groups.update(groupId, { nameLocked: true });
+  assert.equal(store.groups.upsertByFbId({ ...asNew, name: 'Scraped' }).group.nameLocked, true);
   store.close();
 });

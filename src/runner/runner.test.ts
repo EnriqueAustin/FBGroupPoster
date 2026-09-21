@@ -4,8 +4,10 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { matchBlock, isAccountWide, selectBlockText } from './detect.ts';
-import { resultAfterPosting, resultBeforeComposing } from './playwright-runner.ts';
+import {
+  matchBlock, isAccountWide, selectBlockText, selectStatusText, isWrongComposerFailure, WRONG_COMPOSER_TAG,
+} from './detect.ts';
+import { resultAfterPosting, resultBeforeComposing, resultFromError } from './playwright-runner.ts';
 import { decideLoggedIn } from './browser.ts';
 import { SELECTORS } from './composers.ts';
 import { guessComposerType, parseGroupId, parseMemberCount, mergeDiscovered } from './discover-groups.ts';
@@ -253,4 +255,64 @@ test('the photo button patterns do not match unrelated controls', () => {
   for (const label of ['Post', 'Tag people', 'Feeling/activity', 'Go live', 'Check in']) {
     assert.equal(matchesPhoto(label), false, `should not match: ${label}`);
   }
+});
+
+// --- role="status" toasts ------------------------------------------------------
+// Facebook shows some notices (notably "pending approval") as toasts in a
+// status region. Those may signal pending-approval ONLY — generic toasts such
+// as "Couldn't load comments. Try again later." must never trip the breaker.
+
+test('a pending-approval toast in a status region is recognised', () => {
+  const surfaces = { overlayTexts: [], statusTexts: ['Your post is pending approval'], hasFeed: true, bodyText: '' };
+  const r = matchBlock('https://www.facebook.com/groups/1', selectBlockText(surfaces), selectStatusText(surfaces));
+  assert.equal(r.kind, 'pending-approval');
+  assert.match(r.reason ?? '', /status toast/);
+});
+
+test('status-region text cannot signal account-wide or group-level kinds', () => {
+  for (const toast of [
+    "Couldn't load comments. Try again later.",
+    'Slow down',
+    'Security check',
+    "You can't post in this group",
+  ]) {
+    const r = matchBlock('https://www.facebook.com/groups/1', '', toast);
+    assert.equal(r.blocked, false, `status toast must be ignored: ${toast}`);
+  }
+});
+
+test('a real block in a dialog still beats a pending-approval toast', () => {
+  const r = matchBlock('https://www.facebook.com/groups/1', 'You are posting too quickly', 'Your post is pending');
+  assert.equal(r.kind, 'rate-limit');
+});
+
+test('surfaces without statusTexts still work', () => {
+  assert.equal(selectStatusText({ overlayTexts: [], hasFeed: true, bodyText: '' }), '');
+});
+
+// --- the buy-and-sell ComposerError --------------------------------------------
+
+const WRONG_COMPOSER_MESSAGE = 'this group shows "Sell Something" but no "Write something…" composer — this '
+  + 'looks like a buy-and-sell group — set its composer type to "listing" (Marketplace) in the Groups tab';
+
+test('the buy-and-sell composer error is tagged so the orchestrator can quarantine the group', () => {
+  const r = resultFromError(WRONG_COMPOSER_MESSAGE, 'shot.png');
+  assert.equal(r.outcome, 'failed');
+  assert.ok(r.error?.startsWith(`${WRONG_COMPOSER_TAG}:`));
+  assert.equal(r.detail, 'shot.png');
+  assert.equal(isWrongComposerFailure(r), true);
+});
+
+test('the tag survives the hint being on a later line', () => {
+  const r = resultFromError('no status composer\nthis looks like a buy-and-sell group — fix it');
+  assert.equal(isWrongComposerFailure(r), true);
+  assert.equal(r.error, `${WRONG_COMPOSER_TAG}: no status composer`);
+});
+
+test('ordinary errors are not mistaken for a wrong composer type', () => {
+  const r = resultFromError('could not find the group composer\nthe page offered: Join, Share');
+  assert.equal(r.error, 'could not find the group composer');
+  assert.equal(isWrongComposerFailure(r), false);
+  // Only failures count — a posted result mentioning the phrase is not one.
+  assert.equal(isWrongComposerFailure({ outcome: 'posted', error: WRONG_COMPOSER_MESSAGE }), false);
 });
