@@ -36,6 +36,16 @@ export const SELECTORS = {
   ],
   /** The rich-text area inside the open composer dialog. */
   statusTextbox: ['textbox'] as const,
+  /**
+   * Accessible names of textboxes that are NEVER the composer: the comment and
+   * reply boxes under other members' posts ("Comment as <name>", "Write a
+   * comment…"). Real diagnostics show these on group pages, and one can sit
+   * inside a dialog too when a post is opened in a modal. Typing an ad caption
+   * into one comments on a stranger's post, so they are excluded by name even
+   * inside the composer dialog. Anchored, so a composer labelled e.g.
+   * "Create a public post…" can never match.
+   */
+  commentTextbox: [/^comment/i, /^write a comment/i, /^reply/i, /^write a reply/i],
   /** Buttons that attach media, inside the open composer. */
   addPhoto: [
     /photo\/video/i,
@@ -92,15 +102,48 @@ const pause = (min: number, max: number) =>
 export async function typeHumanely(locator: Locator, text: string): Promise<void> {
   await locator.click();
   await pause(200, 600);
-  for (const line of text.split('\n')) {
+  // \r?\n: a caption saved from a Windows textarea arrives with CRLF, and a
+  // stray '\r' would otherwise be pressed as a key of its own.
+  const lines = text.split(/\r?\n/);
+  for (const [i, line] of lines.entries()) {
     for (const ch of line) {
       await locator.press(ch === ' ' ? 'Space' : ch, { delay: 20 + Math.random() * 70 })
         .catch(async () => { await locator.type(ch, { delay: 30 }); });
       if ('.!?'.includes(ch)) await pause(150, 400);
     }
-    // Shift+Enter keeps a newline from submitting the composer.
-    await locator.press('Shift+Enter').catch(() => undefined);
+    // Newlines go BETWEEN lines only. The first version pressed one after every
+    // line including the last, so every caption went out with a trailing blank
+    // line. Shift+Enter rather than Enter keeps a newline from submitting.
+    if (i < lines.length - 1) await locator.press('Shift+Enter').catch(() => undefined);
   }
+}
+
+/** True when a textbox's accessible name marks it as a comment/reply box. */
+export function isCommentTextboxName(name: string): boolean {
+  const n = name.trim();
+  return SELECTORS.commentTextbox.some((re) => re.test(n));
+}
+
+/**
+ * What statusComposer should do given what the group page offers right now.
+ * Pure so the decision can be tested without a browser.
+ *
+ * A buy-and-sell group shows "Sell Something" and no "Write something…", so a
+ * status-type group that only ever shows the listing opener is misconfigured.
+ * Without this check it burns the full opener timeout and then fails with a
+ * generic "could not find the group composer" that points at SELECTORS, which
+ * is the wrong fix. The grace period exists because the two openers need not
+ * render in the same frame: seeing "Sell Something" first must not fail a
+ * group whose "Write something…" is merely a beat behind.
+ */
+export function decideStatusOpener(
+  statusFound: boolean,
+  listingSeenForMs: number | null,
+  graceMs: number,
+): 'use-status' | 'wrong-composer' | 'keep-waiting' {
+  if (statusFound) return 'use-status';
+  if (listingSeenForMs !== null && listingSeenForMs >= graceMs) return 'wrong-composer';
+  return 'keep-waiting';
 }
 
 /**
@@ -145,7 +188,7 @@ async function describeClickables(page: Page): Promise<string[]> {
  * against the SPA finishing its render.
  */
 async function firstVisible(
-  page: Page,
+  scope: Page | Locator,
   role: 'button' | 'textbox',
   patterns: readonly RegExp[],
   what: string,
@@ -154,22 +197,137 @@ async function firstVisible(
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    for (const pattern of patterns) {
-      const byRole = page.getByRole(role, { name: pattern }).first();
-      if (await byRole.isVisible().catch(() => false)) return byRole;
-      const byText = page.getByText(pattern).first();
-      if (await byText.isVisible().catch(() => false)) return byText;
-    }
-    await page.waitForTimeout(750);
+    const found = await findVisible(scope, role, patterns);
+    if (found) return found;
+    await pause(750, 750);
   }
 
-  const clickables = await describeClickables(page);
+  const clickables = await describeClickables(pageOf(scope));
   throw new ComposerError(
     `could not find ${what} after ${Math.round(timeoutMs / 1000)}s`,
     `tried ${patterns.map(String).join(', ')}. What the page actually offers:\n`
     + (clickables.length ? clickables.map((c) => `      · ${c}`).join('\n') : '      (nothing clickable found — page may not have loaded)')
     + '\n      Add the right wording to SELECTORS in src/runner/composers.ts',
   );
+}
+
+/**
+ * One pass of firstVisible, no waiting. Scope is a Page or a Locator (usually
+ * the composer dialog) — both expose the same getBy* API, which is the point:
+ * a field looked up inside the dialog cannot match a lookalike elsewhere.
+ */
+async function findVisible(
+  scope: Page | Locator,
+  role: 'button' | 'textbox',
+  patterns: readonly RegExp[],
+): Promise<Locator | null> {
+  for (const pattern of patterns) {
+    const byRole = scope.getByRole(role, { name: pattern }).first();
+    if (await byRole.isVisible().catch(() => false)) return byRole;
+    const byText = scope.getByText(pattern).first();
+    if (await byText.isVisible().catch(() => false)) return byText;
+  }
+  return null;
+}
+
+/** The Page behind a scope. A Locator has .page(); a Page does not. */
+function pageOf(scope: Page | Locator): Page {
+  return typeof (scope as Locator).page === 'function' ? (scope as Locator).page() : scope as Page;
+}
+
+/**
+ * The composer dialog each page's current post is being written in, as the
+ * token stamped on it by pinComposerDialog. Absent means no composer dialog was
+ * pinned for this post — i.e. the listing form opened as a full page.
+ */
+const pinnedDialogs = new WeakMap<Page, string>();
+const COMPOSER_ATTR = 'data-fbgp-composer';
+let pinCounter = 0;
+
+/**
+ * Wait for the composer dialog that clicking an opener mounts, pin it, and
+ * return a locator for exactly that element — or null if none appeared.
+ *
+ * This is the ONE place the composer dialog is chosen; statusComposer,
+ * listingComposer, attachImages and submitPost all use the element picked
+ * here. The first versions each did their own `getByRole('dialog').first()`,
+ * which could pick a chat popover or cookie notice instead of the composer.
+ *
+ * `.last()` rather than `.first()`: a dialog opened by our click is appended
+ * after anything already on the page, so the newest visible one is the
+ * composer. Hidden dialogs are skipped — Facebook leaves closed ones in the DOM.
+ *
+ * Why pin with an attribute instead of returning that locator: Playwright
+ * locators re-resolve on every use. "Newest visible dialog" re-evaluated after
+ * the composer closes is some OTHER dialog (or nothing), so submitPost's
+ * "dialog closed" receipt would watch the wrong element. A locator on a unique
+ * attribute tracks the one element; it reads hidden once that element hides or
+ * is removed. This assumes React keeps the dialog's root node while it is open,
+ * which it does for a mounted modal.
+ */
+async function pinComposerDialog(page: Page, timeoutMs: number): Promise<Locator | null> {
+  pinnedDialogs.delete(page); // a new post never inherits the last post's dialog
+  const newest = page.getByRole('dialog').filter({ visible: true }).last();
+  const appeared = await newest.waitFor({ state: 'visible', timeout: timeoutMs })
+    .then(() => true).catch(() => false);
+  if (!appeared) return null;
+
+  const token = `c${++pinCounter}`;
+  const tagged = await newest.evaluate((el, [attr, value]) => {
+    document.querySelectorAll(`[${attr}]`).forEach((e) => e.removeAttribute(attr));
+    el.setAttribute(attr, value);
+  }, [COMPOSER_ATTR, token] as const).then(() => true).catch(() => false);
+  if (!tagged) return null;
+
+  pinnedDialogs.set(page, token);
+  return dialogByToken(page, token);
+}
+
+/** The dialog pinned for this page's current post, if any (visible or not). */
+function pinnedComposerDialog(page: Page): Locator | null {
+  const token = pinnedDialogs.get(page);
+  return token ? dialogByToken(page, token) : null;
+}
+
+function dialogByToken(page: Page, token: string): Locator {
+  return page.locator(`[${COMPOSER_ATTR}="${token}"]`);
+}
+
+/**
+ * The accessible name of a textbox, as far as it can be read from the DOM:
+ * aria-label, then the text of aria-labelledby targets, then aria-placeholder.
+ * Facebook's comment boxes carry "Comment as <name>" in one of these.
+ */
+async function textboxName(box: Locator): Promise<string> {
+  return box.evaluate((el) => {
+    const label = el.getAttribute('aria-label');
+    if (label) return label;
+    const ids = el.getAttribute('aria-labelledby');
+    if (ids) {
+      const text = ids.split(/\s+/)
+        .map((id) => document.getElementById(id)?.textContent ?? '')
+        .join(' ').trim();
+      if (text) return text;
+    }
+    return el.getAttribute('aria-placeholder') ?? el.getAttribute('placeholder') ?? '';
+  }).catch(() => '');
+}
+
+/**
+ * The first visible textbox inside `dialog` that is not a comment/reply box.
+ * Polls, because the editor mounts a moment after the dialog frame does.
+ */
+async function composerTextbox(dialog: Locator, timeoutMs: number): Promise<Locator | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const box of await dialog.getByRole('textbox').all().catch(() => [])) {
+      if (!await box.isVisible().catch(() => false)) continue;
+      if (isCommentTextboxName(await textboxName(box))) continue;
+      return box;
+    }
+    await pause(500, 500);
+  }
+  return null;
 }
 
 /**
@@ -189,8 +347,20 @@ async function firstVisible(
  *
  * Now: scope to the composer dialog, click Photo/video to mount its input,
  * then confirm a preview appeared before letting the post proceed.
+ *
+ * The scope is passed in rather than looked up here. The caller has already
+ * chosen the composer (pinComposerDialog) and knows whether a page-wide scope
+ * is legitimate: statusComposer only ever passes its pinned dialog, because it
+ * refuses to continue without one; listingComposer passes the page only when
+ * the listing form opened as a full page and there is no dialog to scope to.
+ * An independent lookup here once had its own guess, and could disagree.
  */
-async function attachImages(page: Page, imagePaths: string[], log: (m: string) => void): Promise<void> {
+async function attachImages(
+  page: Page,
+  scope: Page | Locator,
+  imagePaths: string[],
+  log: (m: string) => void,
+): Promise<void> {
   if (imagePaths.length === 0) return;
 
   // Playwright resolves relative paths against the process cwd, but being
@@ -204,10 +374,13 @@ async function attachImages(page: Page, imagePaths: string[], log: (m: string) =
   }
 
   // Everything below must happen inside the composer, not the page at large.
-  const dialog = page.getByRole('dialog').first();
-  const inDialog = await dialog.isVisible().catch(() => false);
-  const scope = inDialog ? dialog : page;
-  if (!inDialog) log('    [warn] composer dialog not detected — attaching against the page');
+  // If the pinned dialog vanished since the caption went in, stop: falling
+  // back to the page here would hit the unrelated file inputs described above.
+  if (scope !== page && !await (scope as Locator).isVisible().catch(() => false)) {
+    throw new ComposerError('the composer dialog closed before the images were attached',
+      'the post was NOT sent. Check the screenshot in data/media/diagnostics');
+  }
+  if (scope === page) log('    [warn] no composer dialog (full-page listing form) — attaching against the page');
 
   // Click Photo/video: this is what mounts the composer's own file input.
   //
@@ -280,10 +453,25 @@ async function attachImages(page: Page, imagePaths: string[], log: (m: string) =
  * successful submit, and it is the one signal that does not depend on markup.
  */
 export async function submitPost(page: Page, log: (m: string) => void): Promise<void> {
-  const dialog = page.getByRole('dialog').first();
-  const inDialog = await dialog.isVisible().catch(() => false);
-  const scope = inDialog ? dialog : page;
-  if (!inDialog) log('    [warn] composer dialog not detected — looking for Post on the page');
+  // Use the very dialog the composer pinned, so the Post button is looked for
+  // in it and the "closed" receipt below watches it — not whichever dialog is
+  // newest by the time Post is clicked.
+  //
+  // The page-wide fallback stays, but ONLY when no dialog was pinned at all,
+  // which happens for one reason: the listing form opened as a full page, where
+  // there is no dialog to scope to and refusing would make that layout
+  // unpostable in auto mode. When a dialog WAS pinned and is now gone, that is
+  // not a layout — the composer closed or re-rendered under us — so stop rather
+  // than hunt for "Post" across a page full of lookalikes.
+  const dialog = pinnedComposerDialog(page);
+  const inDialog = dialog !== null;
+  if (dialog && !await dialog.isVisible().catch(() => false)) {
+    throw new ComposerError('the composer dialog is no longer open',
+      'the post was NOT sent — the composer closed or was replaced before Post was '
+      + 'clicked. Check the screenshot in data/media/diagnostics');
+  }
+  const scope: Page | Locator = dialog ?? page;
+  if (!dialog) log('    [warn] no composer dialog (full-page listing form) — looking for Post on the page');
 
   // Poll rather than check once: Post stays disabled while the image uploads.
   const deadline = Date.now() + 60_000;
@@ -319,6 +507,8 @@ export async function submitPost(page: Page, log: (m: string) => void): Promise<
   // logged as posted, which is worse than a visible failure: it silently starts
   // a cooldown for a group that never saw anything.
   if (inDialog) {
+    // The pinned locator reads hidden when that element hides OR is removed,
+    // and never jumps to another dialog — which a lazy "newest dialog" would.
     const closed = await dialog.waitFor({ state: 'hidden', timeout: 90_000 })
       .then(() => true).catch(() => false);
     if (!closed) {
@@ -330,6 +520,7 @@ export async function submitPost(page: Page, log: (m: string) => void): Promise<
   } else {
     await page.waitForTimeout(5000);
   }
+  pinnedDialogs.delete(page); // this post is done; the next composer pins afresh
   log('    composer closed — post submitted');
 }
 
@@ -337,16 +528,65 @@ export async function submitPost(page: Page, log: (m: string) => void): Promise<
 export async function statusComposer(ctx: ComposerContext): Promise<void> {
   const { page, variant, log } = ctx;
 
-  const opener = await firstVisible(page, 'button', SELECTORS.openStatusComposer, 'the group composer');
+  const opener = await findStatusOpener(page);
   await opener.click();
   await pause(800, 1800);
 
-  const box = page.getByRole('textbox').first();
-  await box.waitFor({ state: 'visible', timeout: 15_000 });
+  // The caption must go into the composer and nowhere else. The first version
+  // took `page.getByRole('textbox').first()` across the whole page, and a group
+  // page carries a "Comment as <name>" box under other members' posts. If the
+  // dialog was slow to mount, the ad caption was typed as a comment on a
+  // stranger's post. So: wait for the dialog, look only inside it, skip any
+  // comment box by name, and fail rather than fall back to the page.
+  const dialog = await pinComposerDialog(page, 15_000);
+  if (!dialog) {
+    throw new ComposerError('the composer dialog did not open after clicking the composer button',
+      'nothing was typed. Facebook may now open the composer inline or be slow to '
+      + 'respond — check the screenshot in data/media/diagnostics before retrying');
+  }
+  const box = await composerTextbox(dialog, 15_000);
+  if (!box) {
+    throw new ComposerError('the composer dialog opened but has no text box',
+      'nothing was typed. Check SELECTORS.commentTextbox and the screenshot in '
+      + 'data/media/diagnostics — the editor may have changed its role');
+  }
   await typeHumanely(box, variant.caption);
   log('    caption typed');
 
-  await attachImages(page, variant.imagePaths, log);
+  await attachImages(page, dialog, variant.imagePaths, log);
+}
+
+/**
+ * Find the status opener, failing fast if the group is really a buy-and-sell
+ * group. See decideStatusOpener for why this is not simply firstVisible.
+ *
+ * It deliberately does NOT fall through to the listing composer: a listing
+ * needs a title and price the status variant may not have, and silently
+ * posting something else than what was configured is worse than stopping.
+ */
+async function findStatusOpener(page: Page, timeoutMs = 25_000, graceMs = 3_000): Promise<Locator> {
+  const deadline = Date.now() + timeoutMs;
+  let listingSeenAt: number | null = null;
+
+  while (Date.now() < deadline) {
+    const status = await findVisible(page, 'button', SELECTORS.openStatusComposer);
+    if (!status && listingSeenAt === null
+      && await findVisible(page, 'button', SELECTORS.openListingComposer)) {
+      listingSeenAt = Date.now();
+    }
+    const verdict = decideStatusOpener(
+      status !== null, listingSeenAt === null ? null : Date.now() - listingSeenAt, graceMs);
+    if (verdict === 'use-status') return status!;
+    if (verdict === 'wrong-composer') {
+      throw new ComposerError('this group shows "Sell Something" but no "Write something…" composer',
+        'this looks like a buy-and-sell group — set its composer type to "listing" '
+        + '(Marketplace) in the Groups tab');
+    }
+    await pause(750, 750);
+  }
+
+  // Timed out with neither opener: the generic error, with the page's wording.
+  return firstVisible(page, 'button', SELECTORS.openStatusComposer, 'the group composer', 0);
 }
 
 /** Marketplace-style listing composer. */
@@ -357,9 +597,19 @@ export async function listingComposer(ctx: ComposerContext): Promise<void> {
   await opener.click();
   await pause(1000, 2200);
 
+  // Scope field lookups to the listing dialog, for the same reason as the
+  // status composer. Unlike there, a missing dialog falls back to the page with
+  // a warning rather than failing: some layouts open the listing form as a full
+  // page, and the field patterns are anchored names ("Title", "Price") that no
+  // comment box carries, so the page-wide risk is far smaller than "any
+  // textbox". The combobox and attach steps use the same scope.
+  const dialog = await pinComposerDialog(page, 10_000);
+  const scope: Page | Locator = dialog ?? page;
+  if (!dialog) log('    [warn] listing dialog not detected — looking for fields on the page');
+
   const fill = async (patterns: readonly RegExp[], value: string | null, what: string) => {
     if (!value) return;
-    const field = await firstVisible(page, 'textbox', patterns, what);
+    const field = await firstVisible(scope, 'textbox', patterns, what);
     await typeHumanely(field, value);
     log(`    ${what} set`);
   };
@@ -375,16 +625,18 @@ export async function listingComposer(ctx: ComposerContext): Promise<void> {
 
   if (variant.listingCategory) {
     // Category is a combobox rather than a text field, so it gets its own path.
-    const combo = page.getByRole('combobox').first();
+    const combo = scope.getByRole('combobox').first();
     if (await combo.isVisible().catch(() => false)) {
       await combo.click();
       await pause(400, 900);
+      // The option list renders in a popover portalled outside the dialog, so
+      // this one lookup stays page-wide; it only runs right after our click.
       await page.getByRole('option', { name: new RegExp(variant.listingCategory, 'i') }).first()
         .click().catch(() => log(`    could not select category "${variant.listingCategory}" — set it by hand`));
     }
   }
 
-  await attachImages(page, variant.imagePaths, log);
+  await attachImages(page, scope, variant.imagePaths, log);
 }
 
 export function composerFor(kind: 'status' | 'listing'): (ctx: ComposerContext) => Promise<void> {

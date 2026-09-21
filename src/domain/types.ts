@@ -119,8 +119,31 @@ export type PostOutcome =
   | 'posted'
   | 'skipped'
   | 'failed'
-  /** Facebook actively pushed back: block, checkpoint, captcha, rate limit. Trips the breaker. */
+  /**
+   * Facebook actively pushed back. The runner reports this for EVERY kind of
+   * pushback; the orchestrator decides from PostResult.blockKind whether it is
+   * account-wide (trips the breaker) or confined to one group (does not).
+   */
   | 'blocked';
+
+/**
+ * What kind of pushback a page showed. Lives in the domain rather than in
+ * src/runner/detect.ts because it crosses the Runner contract: the
+ * orchestrator needs it to decide between "stop everything" and "skip this
+ * group", and PostResult (a domain contract) has to be able to carry it.
+ *
+ * 'pending-approval' is not a block at all — it means the post DID go out and
+ * is waiting for a group admin. It is recognised here so that it can be told
+ * apart from the real group-level refusals it used to be lumped in with.
+ */
+export type BlockKind =
+  | 'temporary-block'
+  | 'checkpoint'
+  | 'captcha'
+  | 'rate-limit'
+  | 'login-required'
+  | 'group-restricted'
+  | 'pending-approval';
 
 /** Immutable history. This is the source of truth for cooldowns. */
 export interface PostLog {

@@ -4,7 +4,7 @@
  * nothing about Playwright.
  */
 import type {
-  Ad, AdVariant, Business, ComposerType, Group, GroupAssignment,
+  Ad, AdVariant, BlockKind, Business, ComposerType, Group, GroupAssignment,
   Id, IsoDateTime, PostLog, PostOutcome, QueueItem, QueueStatus,
   RunnerMode, Settings,
 } from './types.ts';
@@ -91,6 +91,14 @@ export interface Store {
       { count: number; lastPostedAt: IsoDateTime | null };
     /** Round posts across all groups in [from, to). Enforces roundDailyCap. */
     countRoundPostsBetween(from: IsoDateTime, to: IsoDateTime): number;
+    /**
+     * All-time count of rows with this outcome. A SQL COUNT, not list().length:
+     * list() takes a limit, and a dashboard total computed from a capped list
+     * silently stops growing once history passes the cap.
+     */
+    countByOutcome(outcome: PostOutcome): number;
+    /** How many of these ids are rows with this outcome. Unknown ids count 0. */
+    countIdsWithOutcome(ids: Id[], outcome: PostOutcome): number;
     /**
      * Permanently delete history rows.
      *
@@ -182,6 +190,13 @@ export interface PostResult {
   fbPostUrl?: string;
   error?: string;
   detail?: string;
+  /**
+   * Set whenever outcome is 'blocked'. The orchestrator uses it to tell an
+   * account-wide block (requeue + trip the breaker) from a group-level one
+   * (record it, move on). A 'blocked' result WITHOUT a kind is treated as
+   * account-wide — when in doubt, stop.
+   */
+  blockKind?: BlockKind;
 }
 
 export interface Runner {
@@ -192,7 +207,8 @@ export interface Runner {
    * assisted: fills everything, waits for the human to click Post (or skip).
    * auto:     clicks Post itself.
    * MUST return 'blocked' (never 'failed') on checkpoint / captcha / rate-limit
-   * screens, so the caller can trip the circuit breaker.
+   * screens, with blockKind set, so the caller can trip the circuit breaker.
+   * A post that went out but awaits admin approval is 'posted', not 'blocked'.
    */
   post(job: PostJob): Promise<PostResult>;
   stop(): Promise<void>;

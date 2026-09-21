@@ -10,7 +10,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { PostJob, PostResult, Runner } from '../domain/contracts.ts';
 import { firstPage, launchBrowser, type RunnerBrowser } from './browser.ts';
-import { detectBlock, isAccountWide } from './detect.ts';
+import { detectBlock, isAccountWide, type BlockResult } from './detect.ts';
 import { composerFor, submitPost, waitForPageReady, ComposerError } from './composers.ts';
 
 export interface RunnerOptions {
@@ -36,6 +36,53 @@ async function askOnStdin(prompt: string): Promise<string> {
   } finally {
     rl.close();
   }
+}
+
+/**
+ * What the check BEFORE composing means. Null = carry on and compose.
+ *
+ * Every real kind is reported as 'blocked' with its kind attached; whether
+ * that stops the run or just this group is the orchestrator's call, made from
+ * the kind. The runner only reports what the page said.
+ *
+ * The exception is 'pending-approval': seen before we have posted anything,
+ * it can only be a notice about an EARLIER post. That is not a reason to stop,
+ * and the group's cooldown already covers how often it is posted to.
+ */
+export function resultBeforeComposing(before: BlockResult, log: (m: string) => void = () => {}): PostResult | null {
+  if (!before.blocked) return null;
+  if (before.kind === 'pending-approval') {
+    log('    note: the group shows an earlier post still pending approval — carrying on');
+    return null;
+  }
+  return {
+    outcome: 'blocked',
+    blockKind: before.kind,
+    error: before.reason ?? 'Facebook pushed back',
+    detail: `${before.kind ?? 'unknown'}${before.kind && !isAccountWide(before.kind) ? ' (group-level, not account-wide)' : ''}`,
+  };
+}
+
+/**
+ * What the check AFTER posting means (the human said they posted, or auto
+ * mode's submit succeeded).
+ *
+ * "Your post is pending approval" is the normal result in groups that vet
+ * posts, and it means the post WENT OUT. It must be 'posted' so the group's
+ * cooldown starts; reporting it as a block used to trip the breaker and
+ * requeue the item, and the group then got the same ad a second time.
+ */
+export function resultAfterPosting(after: BlockResult, fbPostUrl: string): PostResult {
+  if (!after.blocked) return { outcome: 'posted', fbPostUrl };
+  if (after.kind === 'pending-approval') {
+    return { outcome: 'posted', fbPostUrl, detail: 'pending admin approval' };
+  }
+  return {
+    outcome: 'blocked',
+    blockKind: after.kind,
+    error: after.reason ?? 'blocked after posting',
+    detail: after.kind,
+  };
 }
 
 export function createRunner(opts: RunnerOptions = {}): Runner {
@@ -77,14 +124,8 @@ export function createRunner(opts: RunnerOptions = {}): Runner {
 
         // Check BEFORE composing. If the account is already restricted there is
         // no point typing anything, and every extra attempt makes it worse.
-        const before = await detectBlock(page);
-        if (before.blocked) {
-          return {
-            outcome: 'blocked',
-            error: before.reason ?? 'Facebook pushed back',
-            detail: `${before.kind ?? 'unknown'}${before.kind && !isAccountWide(before.kind) ? ' (group-level, not account-wide)' : ''}`,
-          };
-        }
+        const refused = resultBeforeComposing(await detectBlock(page), log);
+        if (refused) return refused;
 
         await composerFor(job.group.composerType)({ page, variant: job.variant, log });
 
@@ -107,11 +148,7 @@ export function createRunner(opts: RunnerOptions = {}): Runner {
 
           // Trust the human's answer, but still check that acting on it did not
           // land us on a block screen.
-          const after = await detectBlock(page);
-          if (after.blocked) {
-            return { outcome: 'blocked', error: after.reason ?? 'blocked after posting', detail: after.kind };
-          }
-          return { outcome: 'posted', fbPostUrl: page.url() };
+          return resultAfterPosting(await detectBlock(page), page.url());
         }
 
         // --- auto mode ---
@@ -123,11 +160,7 @@ export function createRunner(opts: RunnerOptions = {}): Runner {
         log(`  AUTO — posting to ${job.group.name} without asking`);
         await submitPost(page, log);
 
-        const after = await detectBlock(page);
-        if (after.blocked) {
-          return { outcome: 'blocked', error: after.reason ?? 'blocked after posting', detail: after.kind };
-        }
-        return { outcome: 'posted', fbPostUrl: page.url() };
+        return resultAfterPosting(await detectBlock(page), page.url());
       } catch (err) {
         const stamp = `fail-group-${job.group.id}-${Date.now()}`;
         const shot = await screenshot(stamp);

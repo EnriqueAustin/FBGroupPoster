@@ -9,6 +9,7 @@ import Fastify from 'fastify';
 import { openStore } from '../store/sqlite-store.ts';
 import { createScheduler } from '../scheduler/planner.ts';
 import { registerRoutes } from './routes.ts';
+import { startOfDayUtcMs } from '../scheduler/time.ts';
 import type { Store } from '../domain/contracts.ts';
 
 function build() {
@@ -287,5 +288,92 @@ test('bring-forward refuses when nothing is waiting', async () => {
   const { app, store } = build();
   const res = await app.inject({ method: 'POST', url: '/api/queue/bring-forward' });
   assert.equal(res.statusCode, 400);
+  store.close();
+});
+
+// --- dashboard stats and log deletion ----------------------------------------
+
+/** A business/group/ad/variant to hang post_log rows off. */
+function seedLogTargets(store: Store) {
+  const biz = store.businesses.create({ name: 'Acme', active: true, dailyCapShare: null });
+  const ad = store.ads.create({ businessId: biz.id, name: 'Ad', composerType: 'status', active: true });
+  const v = store.ads.createVariant({
+    adId: ad.id, caption: 'hi', listingTitle: null, listingPriceCents: null, listingCategory: null,
+    listingLocation: null, imagePaths: [], weight: 1, active: true,
+  });
+  const g = store.groups.create({
+    fbGroupId: 'log', name: 'L', url: 'u', memberCount: null, composerType: 'status', active: true,
+    cooldownDaysOverride: null, rulesNotes: '', quarantinedUntil: null, quarantineReason: null, tags: [],
+  });
+  const common = {
+    queueItemId: null, groupId: g.id, businessId: biz.id, adId: ad.id, variantId: v.id,
+    fbPostUrl: null, error: null, detail: null,
+  };
+  return (outcome: 'posted' | 'failed', postedAt: string, roundId: string | null = null) =>
+    store.log.append({ ...common, outcome, postedAt, roundId });
+}
+
+test('postedAllTime is a true count, not capped at 1000', async () => {
+  const { app, store } = build();
+  const append = seedLogTargets(store);
+  const when = new Date(Date.now() - 86_400_000).toISOString();
+  // The old code filtered list({limit:1000}), so 1001 posts read as 1000 — and
+  // the newest 1000 rows being failures made real posts read as zero.
+  for (let i = 0; i < 1001; i++) append('posted', when);
+  for (let i = 0; i < 5; i++) append('failed', new Date().toISOString());
+
+  const s = json(await app.inject({ method: 'GET', url: '/api/summary' }));
+  assert.equal(s.counts.postedAllTime, 1001);
+  store.close();
+});
+
+test('round.postedToday counts from midnight in settings.timezone', async () => {
+  // Two zones ~25h apart: whatever zone this machine is in, its local midnight
+  // disagrees with at least one of them, which is what the old setHours() used.
+  for (const tz of ['Pacific/Kiritimati', 'Pacific/Pago_Pago']) {
+    const { app, store } = build();
+    store.settings.update({ timezone: tz });
+    const append = seedLogTargets(store);
+    const now = Date.now();
+    const start = startOfDayUtcMs(now, tz);
+    const localMidnight = new Date(now).setHours(0, 0, 0, 0);
+    // Rows either side of both boundaries, all in the past.
+    const stamps = [start - 60_000, start + 60_000, localMidnight - 60_000, localMidnight + 60_000, now - 1_000]
+      .filter((t) => t < now);
+    for (const t of stamps) append('posted', new Date(t).toISOString(), 'r1');
+    append('posted', new Date(now - 1_000).toISOString(), null); // not a round post
+
+    const expected = stamps.filter((t) => t >= start).length;
+    const s = json(await app.inject({ method: 'GET', url: '/api/summary' }));
+    assert.equal(s.round.postedToday, expected, `timezone ${tz}`);
+    store.close();
+  }
+});
+
+test('log delete by id demands confirmPosted only when a posted row is included', async () => {
+  const { app, store } = build();
+  const append = seedLogTargets(store);
+  const when = new Date(Date.now() - 3_600_000).toISOString();
+  const failed = append('failed', when);
+  const posted = append('posted', when);
+
+  // Failures alone go through without confirmation.
+  const ok = await app.inject({ method: 'POST', url: '/api/log/delete', payload: { ids: [failed.id] } });
+  assert.equal(ok.statusCode, 200);
+  assert.equal(json(ok).deleted, 1);
+
+  // Any posted row in the selection is refused, and nothing is deleted.
+  const refused = await app.inject({
+    method: 'POST', url: '/api/log/delete', payload: { ids: [999, posted.id] },
+  });
+  assert.equal(refused.statusCode, 400);
+  assert.match(json(refused).error, /confirmPosted/);
+  assert.equal(store.log.list().length, 1);
+
+  const confirmed = await app.inject({
+    method: 'POST', url: '/api/log/delete', payload: { ids: [posted.id], confirmPosted: true },
+  });
+  assert.equal(json(confirmed).deleted, 1);
+  assert.equal(store.log.list().length, 0);
   store.close();
 });

@@ -4,7 +4,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { matchBlock, isAccountWide } from './detect.ts';
+import { matchBlock, isAccountWide, selectBlockText } from './detect.ts';
+import { resultAfterPosting, resultBeforeComposing } from './playwright-runner.ts';
 import { decideLoggedIn } from './browser.ts';
 import { SELECTORS } from './composers.ts';
 import { guessComposerType, parseGroupId, parseMemberCount, mergeDiscovered } from './discover-groups.ts';
@@ -45,6 +46,72 @@ test('a normal group page is not a block', () => {
 
 test('matching is case-insensitive', () => {
   assert.equal(matchBlock('https://x/', 'SECURITY CHECK').blocked, true);
+});
+
+// --- block detection: where text is read from, and what it means --------------
+
+test('"your post is pending approval" is its own signal, not a group restriction', () => {
+  const r = matchBlock('https://www.facebook.com/groups/123', 'Your post is pending approval by an admin.');
+  assert.equal(r.kind, 'pending-approval');
+  assert.equal(isAccountWide('pending-approval'), false);
+});
+
+test('a real block wins over a pending-approval notice on the same page', () => {
+  const r = matchBlock('https://www.facebook.com/groups/123', 'Your post is pending\nYou are posting too quickly');
+  assert.equal(r.kind, 'rate-limit');
+});
+
+test('login-required stops the run like other account-wide blocks', () => {
+  assert.equal(isAccountWide('login-required'), true);
+  assert.equal(isAccountWide('group-restricted'), false);
+});
+
+test('members’ posts in a group feed are never read as a block', () => {
+  const text = selectBlockText({
+    overlayTexts: [],
+    hasFeed: true,
+    bodyText: 'Great deals! Slow down and read. Try again later if sold out. Security check done on all cars.',
+  });
+  assert.equal(matchBlock('https://www.facebook.com/groups/123', text).blocked, false);
+});
+
+test('a dialog over a group feed is still read', () => {
+  const text = selectBlockText({
+    overlayTexts: ["You're Temporarily Blocked\nIt looks like you were misusing this feature."],
+    hasFeed: true,
+    bodyText: 'ignored',
+  });
+  assert.equal(matchBlock('https://www.facebook.com/groups/123', text).kind, 'temporary-block');
+});
+
+test('a full-page interstitial without a feed is read in full', () => {
+  const text = selectBlockText({ overlayTexts: [], hasFeed: false, bodyText: 'Security Check\nPlease solve this puzzle' });
+  assert.equal(matchBlock('https://www.facebook.com/some/interstitial', text).kind, 'captcha');
+});
+
+test('before composing: a group restriction is reported as blocked with its kind', () => {
+  const r = resultBeforeComposing(matchBlock('https://www.facebook.com/groups/1', 'Only admins can post in this group'));
+  assert.equal(r?.outcome, 'blocked');
+  assert.equal(r?.blockKind, 'group-restricted');
+});
+
+test('before composing: an earlier post pending approval does not stop us', () => {
+  assert.equal(resultBeforeComposing(matchBlock('https://www.facebook.com/groups/1', 'Your post is pending')), null);
+  assert.equal(resultBeforeComposing({ blocked: false }), null);
+});
+
+test('after posting: pending approval means the post went out', () => {
+  const url = 'https://www.facebook.com/groups/1';
+  const r = resultAfterPosting(matchBlock(url, 'Your post is pending approval'), url);
+  assert.equal(r.outcome, 'posted');
+  assert.equal(r.detail, 'pending admin approval');
+  assert.equal(r.fbPostUrl, url);
+});
+
+test('after posting: a real block is reported with its kind', () => {
+  const r = resultAfterPosting(matchBlock('https://www.facebook.com/checkpoint/9/', ''), 'x');
+  assert.equal(r.outcome, 'blocked');
+  assert.equal(r.blockKind, 'checkpoint');
 });
 
 test('parses group ids and rejects list pages', () => {

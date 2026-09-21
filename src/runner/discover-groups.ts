@@ -68,15 +68,97 @@ export function parseMemberCount(text: string): number | null {
   return Math.round(value);
 }
 
+/**
+ * Phrases that only ever appear in notification / activity text, never in a
+ * group's own name. Notification cards link to the group they are about, so
+ * the scrape sees them as "a card with a /groups/ link" exactly like a real
+ * group card — this list is what tells them apart.
+ */
+const NOTIFICATION_PHRASES = [
+  'approved your', 'declined your', 'accepted your', 'commented on', 'replied to',
+  'reacted to', 'posted in', 'shared a', 'shared your', 'invited you', 'mentioned you',
+  'tagged you', 'requested to join', 'wants to join', 'added you', 'changed the name',
+  'is live', 'went live', 'new post in', 'new posts in', 'also commented',
+];
+
+/**
+ * A relative timestamp glued to the end: "…Adverts.12h", "… · 3d", "Just now",
+ * "5 minutes ago". The digits must follow a non-alphanumeric character (or
+ * start the string) so a real name ending in e.g. "4x4" or "Area51" survives.
+ */
+const TRAILING_RELATIVE_TIME =
+  /(?:(?:^|[^a-z0-9])\d{1,3}\s?(?:s|m|h|d|w|y|min|mins|hr|hrs|wk|wks)|just now|yesterday|\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago)$/i;
+
+/**
+ * True when a scraped label is notification text rather than a group name.
+ * Exported separately from cleanGroupName so re-import can recognise junk that
+ * an older version of the scraper already saved to the database.
+ */
+export function looksLikeNotification(raw: string): boolean {
+  const s = raw.replace(/\s+/g, ' ').trim();
+  // Facebook renders the unread marker as its own text node with no separator,
+  // so innerText glues it to the sentence: "UnreadAn admin approved…". Match
+  // only that glued form (or a bare "Unread") so a group genuinely called
+  // "Unread Books Club" is not thrown away.
+  if (/^Unread(?:$|[A-Z])/.test(s) || /^unread$/i.test(s)) return true;
+  const lower = s.toLowerCase();
+  if (NOTIFICATION_PHRASES.some((p) => lower.includes(p))) return true;
+  return TRAILING_RELATIVE_TIME.test(s);
+}
+
+/**
+ * Turn the first line of a scraped card into a group name, or null when the
+ * card was not a group card at all.
+ *
+ * Deliberately rejects rather than repairs: pulling "Cape Town Adverts" out of
+ * "An admin approved your photo in Cape Town Adverts.12h" means parsing prose
+ * whose wording varies by language and notification type, and a wrong guess
+ * gets saved as the group's name. The group's real card on the joined list
+ * supplies the proper name anyway, so dropping the notification loses nothing.
+ * (It also keeps out groups that appear only in notifications — which may be
+ * groups you are not even a member of.)
+ */
+export function cleanGroupName(raw: string): string | null {
+  const s = raw.replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  if (looksLikeNotification(s)) return null;
+  return s;
+}
+
+/**
+ * Pick the better of two names seen for the same group id.
+ *
+ * Longest-wins used to be the whole rule, and that is how notification text
+ * ("…approved your photo in Cape Town Adverts.12h") beat the real name: junk
+ * is the real name with extra words wrapped around it, so it is always longer.
+ * Now: a name that is not notification-like beats one that is; and if one
+ * name contains the other somewhere other than at the start, the shorter wins,
+ * because that shape is "real name wrapped in chrome". Only a plain prefix
+ * extension ("Group" vs "Group One Full Name") still prefers the longer name —
+ * that shape is a truncated label, not added junk.
+ */
+export function pickGroupName(a: string, b: string): string {
+  const aJunk = looksLikeNotification(a);
+  const bJunk = looksLikeNotification(b);
+  if (aJunk !== bJunk) return aJunk ? b : a;
+  const [shorter, longer] = a.length <= b.length ? [a, b] : [b, a];
+  const at = longer.toLowerCase().indexOf(shorter.toLowerCase());
+  if (at > 0) return shorter;
+  return longer;
+}
+
 /** Deduplicate by group id, keeping the entry with the most information. */
 export function mergeDiscovered(rows: DiscoveredGroup[]): DiscoveredGroup[] {
   const byId = new Map<string, DiscoveredGroup>();
   for (const row of rows) {
     const existing = byId.get(row.fbGroupId);
     if (!existing) { byId.set(row.fbGroupId, row); continue; }
+    const name = pickGroupName(existing.name, row.name);
     byId.set(row.fbGroupId, {
       ...existing,
-      name: existing.name.length >= row.name.length ? existing.name : row.name,
+      name,
+      // The listing guess is derived from the name, so it follows the winner.
+      composerTypeGuess: guessComposerType(name),
       memberCount: existing.memberCount ?? row.memberCount,
     });
   }
@@ -144,7 +226,9 @@ export function createGroupDiscoverer(opts: DiscoverOptions = {}): GroupDiscover
           for (const row of rows) {
             const id = parseGroupId(row.href);
             if (!id) continue;
-            const name = (row.text.split('\n')[0] ?? '').trim();
+            // Notification/activity cards link to groups too; cleanGroupName
+            // drops them so their text can never become a group's name.
+            const name = cleanGroupName(row.text.split('\n')[0] ?? '');
             if (!name) continue;
             collected.push({
               fbGroupId: id,

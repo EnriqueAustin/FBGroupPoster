@@ -285,3 +285,33 @@ test('deleting a posted row frees that group from its cooldown', () => {
   assert.equal(store.log.lastPostToGroup(groupId), null);
   store.close();
 });
+
+test('countByOutcome counts all history, with no list() cap', () => {
+  const { store, businessId, groupId, adId, variantId } = fixture();
+  const common = {
+    queueItemId: null, groupId, businessId, adId, variantId,
+    fbPostUrl: null, error: null, detail: null, roundId: null,
+  };
+  for (let i = 0; i < 1005; i++) store.log.append({ ...common, outcome: 'posted', postedAt: daysAgo(1) });
+  store.log.append({ ...common, outcome: 'failed', postedAt: daysAgo(1) });
+  assert.equal(store.log.countByOutcome('posted'), 1005);
+  assert.equal(store.log.countByOutcome('failed'), 1);
+  assert.equal(store.log.countByOutcome('blocked'), 0);
+  store.close();
+});
+
+test('countIdsWithOutcome checks only the given ids', () => {
+  const { store, businessId, groupId, adId, variantId } = fixture();
+  const common = {
+    queueItemId: null, groupId, businessId, adId, variantId,
+    fbPostUrl: null, error: null, detail: null, roundId: null,
+  };
+  const posted = store.log.append({ ...common, outcome: 'posted', postedAt: daysAgo(1) });
+  const failed = store.log.append({ ...common, outcome: 'failed', postedAt: daysAgo(1) });
+  store.log.append({ ...common, outcome: 'posted', postedAt: daysAgo(2) }); // not asked about
+
+  assert.equal(store.log.countIdsWithOutcome([failed.id], 'posted'), 0);
+  assert.equal(store.log.countIdsWithOutcome([failed.id, posted.id, 9999], 'posted'), 1);
+  assert.equal(store.log.countIdsWithOutcome([], 'posted'), 0);
+  store.close();
+});

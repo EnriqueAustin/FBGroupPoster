@@ -6,8 +6,12 @@
  * Deliberately thin. Scheduling decisions live in src/scheduler; browser work
  * lives in src/runner. This file only sequences them and records what happened.
  */
-import type { Runner, Store } from './domain/contracts.ts';
+import type { PostResult, Runner, Store } from './domain/contracts.ts';
 import type { Id, PostOutcome, QueueItem } from './domain/types.ts';
+// Pure policy function with no browser dependency (detect.ts only imports
+// Playwright's types). Imported rather than restated so "which blocks stop the
+// run" has exactly one definition.
+import { isAccountWide } from './runner/detect.ts';
 
 export interface OrchestratorOptions {
   store: Store;
@@ -28,6 +32,40 @@ export interface RunSummary {
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Turn what the runner saw into what the run should do about it.
+ *
+ * The runner reports every kind of pushback as 'blocked'. Only account-wide
+ * ones may trip the breaker: one group refusing a post says nothing about the
+ * account, and stopping the whole run for it (while also requeueing the item
+ * for that same group) was both over-cautious and a source of duplicates.
+ *
+ * - account-wide, or no kind given   → stays 'blocked' (requeue + breaker).
+ *   A missing kind is treated as the worst case on purpose.
+ * - 'pending-approval'               → 'posted'. The post went out and waits
+ *   for an admin; the cooldown must start. (The runner already maps this
+ *   itself; handled here too so a runner that doesn't cannot cause a repost.)
+ * - 'group-restricted'               → 'failed' for this item only. Not
+ *   requeued: the group refused us, and retrying it later would just get the
+ *   same answer. 'failed' rather than 'skipped' so it stands out in history
+ *   as something a human should look at (leave the group, fix its settings).
+ */
+export function resolveResult(result: PostResult): PostResult {
+  if (result.outcome !== 'blocked') return result;
+  const kind = result.blockKind;
+  if (!kind || isAccountWide(kind)) return result;
+
+  if (kind === 'pending-approval') {
+    return { outcome: 'posted', fbPostUrl: result.fbPostUrl, detail: 'pending admin approval' };
+  }
+  return {
+    outcome: 'failed',
+    blockKind: kind,
+    error: `group-level restriction, not account-wide: ${result.error ?? kind}`,
+    detail: result.detail,
+  };
+}
 
 export function createOrchestrator(opts: OrchestratorOptions) {
   const { store, runner } = opts;
@@ -188,7 +226,13 @@ export function createOrchestrator(opts: OrchestratorOptions) {
           + `${item.roundId ? `  [${item.roundId}]` : ''}`);
         if (job.group.rulesNotes.trim()) log(`    group rules: ${job.group.rulesNotes.trim()}`);
 
-        const result = await runner.post(job);
+        // Resolve BEFORE recording, so the history shows what actually
+        // happened (e.g. 'posted' for a post awaiting approval) and cooldowns,
+        // which read the history, see it too.
+        const result = resolveResult(await runner.post(job));
+        if (result.outcome === 'failed' && result.blockKind) {
+          log(`    ${job.group.name} refused the post (${result.blockKind}) — moving on; the breaker is NOT tripped`);
+        }
         record(item, result.outcome, result);
 
         switch (result.outcome) {
@@ -205,6 +249,8 @@ export function createOrchestrator(opts: OrchestratorOptions) {
             store.queue.update(item.id, { status: 'failed', lastError: result.error ?? 'unknown error' });
             break;
           case 'blocked':
+            // Only account-wide pushback reaches here — resolveResult has
+            // already turned group-level refusals into 'failed'.
             summary.blocked++;
             // Put the item back so it is not lost, then stop everything.
             store.queue.update(item.id, { status: 'pending', lastError: result.error ?? 'blocked by Facebook' });

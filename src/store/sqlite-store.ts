@@ -476,6 +476,18 @@ export function openStore(dbPath: string): Store {
           AND posted_at >= ? AND posted_at < ?`).get(from, to) as Row;
       return num(r.n);
     },
+    countByOutcome(outcome) {
+      const r = one('SELECT COUNT(*) AS n FROM post_log WHERE outcome = ?').get(outcome) as Row;
+      return num(r.n);
+    },
+    countIdsWithOutcome(ids, outcome) {
+      // Lets the delete endpoint ask "would this touch a successful post?" in
+      // one query, instead of loading the whole log once per id.
+      if (ids.length === 0) return 0;
+      const r = db.prepare(`SELECT COUNT(*) AS n FROM post_log
+        WHERE outcome = ? AND id IN (${ids.map(() => '?').join(', ')})`).get(outcome, ...ids) as Row;
+      return num(r.n);
+    },
     remove(ids) {
       if (ids.length === 0) return 0;
       return db.prepare(`DELETE FROM post_log WHERE id IN (${ids.map(() => '?').join(', ')})`)

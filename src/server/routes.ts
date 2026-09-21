@@ -14,6 +14,7 @@ import { createGroupDiscoverer } from '../runner/discover-groups.ts';
 import { createRunner } from '../runner/playwright-runner.ts';
 import { createOrchestrator } from '../orchestrator.ts';
 import { commitRound, planRound } from '../scheduler/rounds.ts';
+import { startOfDayUtcMs, toIso } from '../scheduler/time.ts';
 
 const idParam = z.object({ id: z.coerce.number().int().positive() });
 const composerType = z.enum(['status', 'listing']);
@@ -302,8 +303,10 @@ export function registerRoutes(app: FastifyInstance, store: Store, scheduler: Sc
 
     if (!body.confirmPosted) {
       const wouldTouchPosted = (body.outcomes ?? []).includes('posted')
-        || (body.ids ?? []).some((id) => store.log.list({ limit: 100000 })
-          .some((l) => l.id === id && l.outcome === 'posted'));
+        // One COUNT over the given ids. This used to reload the entire log
+        // once per id, which is quadratic in exactly the case — a big bulk
+        // delete — where it hurts.
+        || store.log.countIdsWithOutcome(body.ids ?? [], 'posted') > 0;
       if (wouldTouchPosted) {
         throw badRequest(
           'that selection includes successful posts, which are what the cooldowns are '
@@ -508,15 +511,19 @@ export function registerRoutes(app: FastifyInstance, store: Store, scheduler: Sc
         ads: store.ads.list().length,
         queuePending: waiting.length,
         queueDueNow: dueNow.length,
-        postedAllTime: store.log.list({ limit: 1000 }).filter((l) => l.outcome === 'posted').length,
+        // A real COUNT: filtering list({limit:1000}) froze this at 1000.
+        postedAllTime: store.log.countByOutcome('posted'),
       },
       nextDueAt: upcoming[0]?.scheduledFor ?? null,
       round: {
         // What is left of an in-flight round, so the UI can say "9 of 20 to go"
         // rather than leaving a half-finished round looking like normal queue.
         queued: waiting.filter((q) => q.roundId !== null).length,
+        // "Today" is the user's day in settings.timezone — the same day
+        // roundDailyCap is enforced against — not the server's local midnight,
+        // which differs whenever the machine's zone does (a VPS on UTC, say).
         postedToday: store.log.countRoundPostsBetween(
-          new Date(new Date().setHours(0, 0, 0, 0)).toISOString(), nowIso),
+          toIso(startOfDayUtcMs(Date.now(), s.timezone)), nowIso),
       },
     };
   });

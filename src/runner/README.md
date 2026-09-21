@@ -33,6 +33,20 @@ In rough order of likelihood:
    the joined-groups page. The anchor query in `discover()` is the thing to
    adjust; the parsing helpers around it are tested and are probably fine.
 
+Two composer failures are deliberate stops, not selector bugs:
+
+- **"the composer dialog did not open"** — the caption is only ever typed into
+  a text box *inside* the composer dialog, never one found page-wide. A group
+  page has `Comment as <name>` boxes under other members' posts, and a
+  page-wide lookup once risked typing the ad as a comment on a stranger's post.
+  Boxes named like `SELECTORS.commentTextbox` are skipped even inside the
+  dialog. If no dialog appears, nothing is typed.
+- **"shows Sell Something but no Write something…"** — the group is a
+  buy-and-sell group configured as a normal one. Set its composer type to
+  "listing" (Marketplace) in the Groups tab. The runner does not switch
+  composers on its own, because a listing needs a title and price the variant
+  may not have.
+
 Failures screenshot themselves into `data/media/diagnostics/` — look there
 first, it usually shows exactly what the page looked like.
 
@@ -58,6 +72,11 @@ each cost a silent failure once:
   Post greyed out until the image finishes uploading, and clicking a disabled
   button does nothing.
 - It tries every pattern in `SELECTORS.submit`, polling for up to 60s.
+- It uses the **same dialog the composer opened**. The composer marks that one
+  element when it appears; attaching images, finding Post and the receipt below
+  all use it, so a chat popover or other modal can never stand in. Post is
+  searched page-wide only when no dialog was opened at all, which happens only
+  when the listing form opens as a full page.
 - It treats the **dialog closing** as the receipt. If the composer is still
   open, the post did not go out and the run says `failed` with a screenshot.
 

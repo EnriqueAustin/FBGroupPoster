@@ -209,3 +209,86 @@ test('stop() ends the run even while it is waiting for the next post', () => {
     store.close();
   });
 });
+
+// --- group-level vs account-wide pushback ------------------------------------
+
+/** A runner that plays back one scripted result per post, then posts normally. */
+function scriptedRunner(results: PostResult[]): Runner & { jobs: PostJob[] } {
+  const jobs: PostJob[] = [];
+  return {
+    jobs,
+    async start() {},
+    async post(job) { jobs.push(job); return results[jobs.length - 1] ?? { outcome: 'posted' }; },
+    async stop() {},
+  };
+}
+
+test('a group-level restriction does not trip the breaker, is not requeued, and the run moves on', () => {
+  const { store, bizId, adId, variantId, groupIds } = fixture();
+  const items = queueRound(store, { bizId, adId, variantId, groupIds, startMs: START, gapMs: 7 * MIN, roundId: 'r1' });
+
+  const clock = fakeClock(START);
+  const runner = scriptedRunner([
+    { outcome: 'blocked', blockKind: 'group-restricted', error: 'page said "only admins can post" (group-restricted)' },
+  ]);
+  const orch = createOrchestrator({ store, runner, now: clock.now, sleep: clock.sleep, log: () => {} });
+
+  return orch.runDue(4, 17 * MIN).then((summary) => {
+    assert.equal(store.settings.get().breakerTripped, false, 'one group refusing must not stop the account');
+    assert.equal(summary.blocked, 0);
+    assert.equal(summary.failed, 1);
+    assert.equal(summary.posted, 3, 'the rest of the round must still go out');
+    assert.equal(store.queue.get(items[0]!.id)?.status, 'failed', 'must not go back to pending — that is a repost');
+    const history = store.log.list({ groupId: groupIds[0] });
+    assert.equal(history.length, 1);
+    assert.equal(history[0]!.outcome, 'failed');
+    assert.match(history[0]!.error ?? '', /group-level/);
+    store.close();
+  });
+});
+
+test('a post pending admin approval is recorded as posted, so the cooldown applies', () => {
+  const { store, bizId, adId, variantId, groupIds } = fixture();
+  const items = queueRound(store, {
+    bizId, adId, variantId, groupIds: groupIds.slice(0, 1), startMs: START, gapMs: 0, roundId: null,
+  });
+
+  const clock = fakeClock(START);
+  // Deliberately the raw form a runner might report; the orchestrator must
+  // still refuse to treat it as a block.
+  const runner = scriptedRunner([
+    { outcome: 'blocked', blockKind: 'pending-approval', fbPostUrl: 'https://facebook.com/groups/g0', error: 'pending' },
+  ]);
+  const orch = createOrchestrator({ store, runner, now: clock.now, sleep: clock.sleep, log: () => {} });
+
+  return orch.runDue(1).then((summary) => {
+    assert.equal(summary.posted, 1);
+    assert.equal(summary.blocked, 0);
+    assert.equal(store.settings.get().breakerTripped, false);
+    assert.equal(store.queue.get(items[0]!.id)?.status, 'posted');
+    const last = store.log.lastPostToGroup(groupIds[0]!);
+    assert.ok(last, 'cooldown maths must see this post');
+    assert.equal(last.detail, 'pending admin approval');
+    store.close();
+  });
+});
+
+for (const kind of ['rate-limit', 'checkpoint', 'captcha', 'temporary-block', 'login-required'] as const) {
+  test(`an account-wide ${kind} requeues the item and trips the breaker`, () => {
+    const { store, bizId, adId, variantId, groupIds } = fixture();
+    const items = queueRound(store, { bizId, adId, variantId, groupIds, startMs: START, gapMs: 7 * MIN, roundId: 'r1' });
+
+    const clock = fakeClock(START);
+    const runner = scriptedRunner([{ outcome: 'blocked', blockKind: kind, error: kind }]);
+    const orch = createOrchestrator({ store, runner, now: clock.now, sleep: clock.sleep, log: () => {} });
+
+    return orch.runDue(4, 17 * MIN).then((summary) => {
+      assert.equal(summary.blocked, 1);
+      assert.equal(summary.attempted, 1, 'the run must stop on the first account-wide block');
+      assert.equal(summary.stoppedBecause, 'breaker');
+      assert.equal(store.settings.get().breakerTripped, true);
+      assert.equal(store.queue.get(items[0]!.id)?.status, 'pending');
+      store.close();
+    });
+  });
+}
