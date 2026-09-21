@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Group Poster</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%236366f1'/%3E%3Cstop offset='1' stop-color='%23d946ef'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='url(%23g)'/%3E%3Cpath d='M8 15l14-5v12L8 18z' fill='none' stroke='white' stroke-width='2.4' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="mark"><svg viewBox="0 0 24 24"><path d="m3 11 18-5v12L3 14v-3z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/></svg></span>
+        <div><b>Group Poster</b><span>Local control panel</span></div>
+      </div>
+      <nav id="nav">
+        <span class="label">Overview</span>
+        <button data-view="dashboard" class="active"><span class="ic" data-icon="dashboard"></span> Dashboard</button>
+        <button data-view="setup"><span class="ic" data-icon="play"></span> Setup &amp; Run</button>
+        <span class="label">Content</span>
+        <button data-view="groups"><span class="ic" data-icon="users"></span> Groups <span class="count" id="c-groups"></span></button>
+        <button data-view="ads"><span class="ic" data-icon="megaphone"></span> Ads <span class="count" id="c-ads"></span></button>
+        <span class="label">Posting</span>
+        <button data-view="plan"><span class="ic" data-icon="calendar"></span> Plan</button>
+        <button data-view="rounds"><span class="ic" data-icon="repeat"></span> Rounds</button>
+        <button data-view="queue"><span class="ic" data-icon="list"></span> Queue &amp; Log <span class="count" id="c-queue"></span></button>
+        <button data-view="settings"><span class="ic" data-icon="shield"></span> Safety</button>
+      </nav>
+      <div class="foot">
+        <div class="line" id="foot-job"><span class="dot"></span><span>Idle</span></div>
+        <div class="line"><span id="foot-mode"></span></div>
+        <div class="dim">Local only · 127.0.0.1</div>
+      </div>
+    </aside>
+
+    <main class="content">
+      <div class="content-inner">
+        <div id="breaker" hidden class="banner bad">
+          <span class="ic" data-icon="alert"></span>
+          <div class="txt">
+            <strong>Circuit breaker tripped — nothing will post.</strong>
+            <p id="breaker-reason"></p>
+          </div>
+          <div class="acts"><button class="btn danger" id="clear-breaker">Clear it</button></div>
+        </div>
+        <div id="view"></div>
+      </div>
+    </main>
+  </div>
+
+  <div id="modal-root"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
