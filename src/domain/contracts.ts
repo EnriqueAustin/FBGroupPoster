@@ -103,6 +103,8 @@ export interface Store {
       { count: number; lastPostedAt: IsoDateTime | null };
     /** Round posts across all groups in [from, to). Enforces roundDailyCap. */
     countRoundPostsBetween(from: IsoDateTime, to: IsoDateTime): number;
+    /** Reset all round rest periods by nullifying round_id in history. */
+    resetRoundLimits(): number;
     /**
      * All-time count of rows with this outcome. A SQL COUNT, not list().length:
      * list() takes a limit, and a dashboard total computed from a capped list

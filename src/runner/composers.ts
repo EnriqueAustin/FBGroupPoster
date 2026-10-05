@@ -111,11 +111,56 @@ export async function typeHumanely(locator: Locator, text: string): Promise<void
         .catch(async () => { await locator.type(ch, { delay: 30 }); });
       if ('.!?'.includes(ch)) await pause(150, 400);
     }
+    // Facebook now offers @-mention suggestions for plain words that resemble
+    // a member's name (no '@' needed), and Enter — Shift+Enter included —
+    // accepts the highlighted one. Captions went out with words turned into
+    // tags of strangers (2026-10-04), so close any open suggestion list first.
+    // Only before a newline: nothing accepts a suggestion after the last line,
+    // and a single-line listing field (location) keeps its own dropdown.
     // Newlines go BETWEEN lines only. The first version pressed one after every
     // line including the last, so every caption went out with a trailing blank
     // line. Shift+Enter rather than Enter keeps a newline from submitting.
-    if (i < lines.length - 1) await locator.press('Shift+Enter').catch(() => undefined);
+    if (i < lines.length - 1) {
+      await dismissTypeahead(locator);
+      await locator.press('Shift+Enter').catch(() => undefined);
+    }
   }
+}
+
+/** Whether a mention/typeahead suggestion list is open for `box`. */
+async function typeaheadOpen(box: Locator): Promise<boolean> {
+  try {
+    return await box.evaluate((el) => {
+      const visible = (e: Element | null) => !!e && e.getClientRects().length > 0;
+      if (el.getAttribute('aria-expanded') === 'true') return true;
+      const active = el.getAttribute('aria-activedescendant');
+      if (active && visible(document.getElementById(active))) return true;
+      const controls = el.getAttribute('aria-controls');
+      if (controls && visible(document.getElementById(controls))) return true;
+      return Array.from(document.querySelectorAll('[role="listbox"]')).some(visible);
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Close an open suggestion list without accepting it. Escape is only pressed
+ * when a list is actually open: with none open, Escape in the composer can
+ * start Facebook's "discard post?" flow.
+ */
+async function dismissTypeahead(box: Locator): Promise<void> {
+  for (let attempt = 0; attempt < 3 && await typeaheadOpen(box); attempt++) {
+    await box.press('Escape').catch(() => undefined);
+    await pause(150, 300);
+  }
+}
+
+/** Names of people/pages tagged inside the composer text — should be none. */
+async function insertedMentions(box: Locator): Promise<string[]> {
+  return box.evaluate((el) => Array.from(
+    el.querySelectorAll('a[href], [data-mention], [data-lexical-mention], [data-testid*="mention" i]'),
+  ).map((m) => (m.textContent ?? '').trim()).filter(Boolean)).catch(() => []);
 }
 
 /** True when a textbox's accessible name marks it as a comment/reply box. */
@@ -271,9 +316,13 @@ async function pinComposerDialog(page: Page, timeoutMs: number): Promise<Locator
   const appeared = await newest.waitFor({ state: 'visible', timeout: timeoutMs })
     .then(() => true).catch(() => false);
   if (!appeared) return null;
+  return pinDialog(page, newest);
+}
 
+/** Stamp `dialog` as this page's composer and return a locator for exactly it. */
+async function pinDialog(page: Page, dialog: Locator): Promise<Locator | null> {
   const token = `c${++pinCounter}`;
-  const tagged = await newest.evaluate((el, [attr, value]) => {
+  const tagged = await dialog.evaluate((el, [attr, value]) => {
     document.querySelectorAll(`[${attr}]`).forEach((e) => e.removeAttribute(attr));
     el.setAttribute(attr, value);
   }, [COMPOSER_ATTR, token] as const).then(() => true).catch(() => false);
@@ -313,21 +362,66 @@ async function textboxName(box: Locator): Promise<string> {
   }).catch(() => '');
 }
 
+/** The first visible textbox inside `dialog` that is not a comment/reply box. */
+async function usableTextbox(dialog: Locator): Promise<Locator | null> {
+  for (const box of await dialog.getByRole('textbox').all().catch(() => [])) {
+    if (!await box.isVisible().catch(() => false)) continue;
+    if (isCommentTextboxName(await textboxName(box))) continue;
+    return box;
+  }
+  return null;
+}
+
 /**
- * The first visible textbox inside `dialog` that is not a comment/reply box.
- * Polls, because the editor mounts a moment after the dialog frame does.
+ * The composer's text box, and the dialog it lives in. Polls, because the
+ * editor mounts a moment after the dialog frame does.
+ *
+ * The pinned dialog is tried first, but it is not trusted blindly: live runs
+ * showed the "Create post" dialog open with its editor on screen while the
+ * pinned element held no textbox at all — Facebook mounts a placeholder dialog
+ * first and swaps in the real one, or another visible dialog was newest at pin
+ * time. So when the pinned one has no usable box, every other visible dialog is
+ * checked (newest first) and the one holding the editor is re-pinned, so
+ * attachImages and submitPost follow it. The search never leaves dialogs, and
+ * comment boxes are still skipped — the page-wide risk this guards against is
+ * unchanged.
  */
-async function composerTextbox(dialog: Locator, timeoutMs: number): Promise<Locator | null> {
+async function composerTextbox(
+  page: Page,
+  timeoutMs: number,
+  log: (m: string) => void,
+): Promise<{ dialog: Locator; box: Locator } | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    for (const box of await dialog.getByRole('textbox').all().catch(() => [])) {
-      if (!await box.isVisible().catch(() => false)) continue;
-      if (isCommentTextboxName(await textboxName(box))) continue;
-      return box;
+    const pinned = pinnedComposerDialog(page);
+    if (pinned) {
+      const box = await usableTextbox(pinned);
+      if (box) return { dialog: pinned, box };
+    }
+    const visible = await page.getByRole('dialog').filter({ visible: true }).all().catch(() => []);
+    for (const candidate of visible.reverse()) {
+      if (!await usableTextbox(candidate)) continue;
+      const repinned = await pinDialog(page, candidate);
+      const box = repinned && await usableTextbox(repinned);
+      if (repinned && box) {
+        log('    [info] composer editor was in a different dialog than first detected — re-pinned');
+        return { dialog: repinned, box };
+      }
     }
     await pause(500, 500);
   }
   return null;
+}
+
+/** Dialogs and their textboxes as seen now — for the error when none fits. */
+async function describeDialogs(page: Page): Promise<string> {
+  return page.evaluate(() => Array.from(document.querySelectorAll('[role="dialog"]'))
+    .filter((d) => (d as HTMLElement).offsetParent !== null || d.getClientRects().length > 0)
+    .map((d) => {
+      const boxes = Array.from(d.querySelectorAll('[role="textbox"], [contenteditable="true"]'))
+        .map((b) => `${b.getAttribute('role') ?? 'editable'}(${b.getAttribute('aria-label') ?? b.getAttribute('aria-placeholder') ?? ''})`);
+      return `dialog "${d.getAttribute('aria-label') ?? ''}": ${boxes.length ? boxes.join(', ') : 'no textboxes'}`;
+    }).join('; ')).catch(() => '');
 }
 
 /**
@@ -538,19 +632,25 @@ export async function statusComposer(ctx: ComposerContext): Promise<void> {
   // dialog was slow to mount, the ad caption was typed as a comment on a
   // stranger's post. So: wait for the dialog, look only inside it, skip any
   // comment box by name, and fail rather than fall back to the page.
-  const dialog = await pinComposerDialog(page, 15_000);
-  if (!dialog) {
+  if (!await pinComposerDialog(page, 15_000)) {
     throw new ComposerError('the composer dialog did not open after clicking the composer button',
       'nothing was typed. Facebook may now open the composer inline or be slow to '
       + 'respond — check the screenshot in data/media/diagnostics before retrying');
   }
-  const box = await composerTextbox(dialog, 15_000);
-  if (!box) {
+  const found = await composerTextbox(page, 15_000, log);
+  if (!found) {
     throw new ComposerError('the composer dialog opened but has no text box',
-      'nothing was typed. Check SELECTORS.commentTextbox and the screenshot in '
-      + 'data/media/diagnostics — the editor may have changed its role');
+      'nothing was typed. Dialogs on screen: ' + ((await describeDialogs(page)) || '(none readable)')
+      + '. Check SELECTORS.commentTextbox and the screenshot in data/media/diagnostics');
   }
+  const { dialog, box } = found;
   await typeHumanely(box, variant.caption);
+  const mentions = await insertedMentions(box);
+  if (mentions.length) {
+    throw new ComposerError(`the caption picked up tags of other people (${mentions.join(', ')})`,
+      'nothing was posted. Facebook turned words of the caption into @-mentions while '
+      + 'typing — check the screenshot in data/media/diagnostics');
+  }
   log('    caption typed');
 
   await attachImages(page, dialog, variant.imagePaths, log);

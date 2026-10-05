@@ -491,6 +491,9 @@ export function openStore(dbPath: string): Store {
           AND posted_at >= ? AND posted_at < ?`).get(from, to) as Row;
       return num(r.n);
     },
+    resetRoundLimits() {
+      return one(`UPDATE post_log SET round_id = NULL WHERE round_id IS NOT NULL`).run().changes;
+    },
     countByOutcome(outcome) {
       const r = one('SELECT COUNT(*) AS n FROM post_log WHERE outcome = ?').get(outcome) as Row;
       return num(r.n);

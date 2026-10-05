@@ -335,6 +335,18 @@ function applyAssignments() {
 }
 
 const nameOf = (id, list) => list.find((x) => x.id === id)?.name ?? `#${id}`;
+/**
+ * A group name that opens the group on Facebook in a new tab. Used by every
+ * table that names a group, so a post you need to go and delete by hand is one
+ * click from the group it landed in. Falls back to plain text for a group that
+ * is no longer in the registry — history outlives groups.
+ */
+const groupLink = (groupId) => {
+  const g = state.groups.find((x) => x.id === groupId);
+  if (!g?.url) return nameOf(groupId, state.groups);
+  return el('a', { href: g.url, target: '_blank', rel: 'noreferrer', class: 'glink', title: `Open ${g.name} on Facebook` },
+    g.name, icon('external'));
+};
 /** "V2" — the same numbering the Ads screen shows, rather than a database id. */
 const variantLabel = (variantId) => {
   for (const ad of state.ads) {
@@ -1172,7 +1184,7 @@ function viewPlan() {
               el('tr', { class: 'day' }, el('td', { colspan: '5' }, `${fmtDay(list[0].scheduledFor)} · ${plural(list.length, 'post')}`)),
               ...list.map((p) => el('tr', {},
                 el('td', { class: 'nowrap mono dim' }, fmtClock(p.scheduledFor)),
-                el('td', {}, nameOf(p.groupId, state.groups)),
+                el('td', {}, groupLink(p.groupId)),
                 el('td', {}, nameOf(p.businessId, state.businesses)),
                 el('td', {}, nameOf(p.adId, state.ads)),
                 el('td', { class: 'dim mono' }, variantLabel(p.variantId))))]))))),
@@ -1278,7 +1290,7 @@ async function viewQueue() {
             checkOne('queue', q.id),
             el('td', { class: 'nowrap' }, el('div', { class: 'mono' }, fmtTime(q.scheduledFor)),
               el('div', { class: 'dim small' }, relTime(q.scheduledFor))),
-            el('td', {}, nameOf(q.groupId, state.groups), q.roundId ? el('span', { class: 'tag accent', style: 'margin-left:6px' }, 'round') : null),
+            el('td', {}, groupLink(q.groupId), q.roundId ? el('span', { class: 'tag accent', style: 'margin-left:6px' }, 'round') : null),
             el('td', {}, nameOf(q.adId, state.ads)),
             el('td', { class: 'dim' }, q.runnerMode),
             el('td', {}, el('span', { class: `pill ${q.status}`, title: q.lastError ?? '' }, q.status)),
@@ -1340,11 +1352,17 @@ async function viewQueue() {
           el('tbody', {}, rows.map((l) => el('tr', { class: picked.log.has(l.id) ? 'selected' : '' },
             checkOne('log', l.id),
             el('td', { class: 'nowrap mono' }, fmtTime(l.postedAt)),
-            el('td', {}, nameOf(l.groupId, state.groups)),
+            el('td', {}, groupLink(l.groupId)),
             el('td', {}, nameOf(l.adId, state.ads)),
-            el('td', {}, el('span', { class: `pill ${l.outcome}` }, l.outcome)),
+            // The post link sits next to the outcome, not buried in Detail:
+            // Detail is where errors go, and this is the link you follow when
+            // you need to take a post back down on Facebook.
+            el('td', { class: 'nowrap' }, el('span', { class: `pill ${l.outcome}` }, l.outcome),
+              l.fbPostUrl
+                ? el('a', { href: l.fbPostUrl, target: '_blank', rel: 'noreferrer', class: 'glink small',
+                  style: 'margin-left:8px', title: 'Open this post on Facebook' }, 'the post', icon('external'))
+                : null),
             el('td', { class: 'dim', style: 'max-width:340px' },
-              l.fbPostUrl ? el('a', { href: l.fbPostUrl, target: '_blank', rel: 'noreferrer', class: 'row small' }, 'View post', icon('external')) : null,
               el('div', { class: 'clamp2', title: l.error ?? l.detail ?? '' }, l.error ?? l.detail ?? '')),
             el('td', { style: 'text-align:right' }, btn('', () => deleteLog({ ids: [l.id] }, 'this history row'),
               { kind: 'ghost danger-hover', size: 'sm', icon: 'trash', title: 'Delete' }))))))),
@@ -1353,8 +1371,9 @@ async function viewQueue() {
 
   mount(
     pageHead('Queue & Log', qState.tab === 'queue'
-      ? 'What is scheduled. Deleting a queue item removes the plan, not the record that it posted.'
-      : 'What actually happened. Cooldowns are computed from this table.', tabs),
+      ? 'What is scheduled. Click a group to open it on Facebook. Deleting a queue item removes the plan, not the record that it posted.'
+      : 'What actually happened. Click a group — or "the post" — to open it on Facebook and take a post down by hand; '
+        + 'deleting a row here only removes our record. Cooldowns are computed from this table.', tabs),
     body,
   );
 }
@@ -1610,6 +1629,7 @@ async function viewRounds() {
   await hydrateAssignments();
 
   const s = state.settings;
+  const c = state.counts;
   const businesses = state.businesses.filter((b) => b.active);
   if (!businesses.some((b) => b.id === roundPick.businessId)) roundPick.businessId = businesses[0]?.id ?? null;
 
@@ -1623,6 +1643,32 @@ async function viewRounds() {
   const assignedIds = state.assignments.get(roundPick.businessId) ?? new Set();
   const assignedActive = state.groups.filter((g) => g.active && assignedIds.has(g.id)).length;
 
+  // --- clear-quarantine checkbox ---------------------------------------------
+  const qCount = c.groupsQuarantined ?? 0;
+  const clearQCheck = el('input', { type: 'checkbox', checked: false });
+  clearQCheck.onchange = async () => {
+    if (!clearQCheck.checked) return;
+    clearQCheck.disabled = true;
+    try {
+      const r = await post('/api/groups/clear-quarantine', {});
+      flash(`Quarantine cleared on ${plural(r.cleared, 'group')}.`, 'ok');
+      roundPick.plan = null;
+      await viewRounds();
+    } catch (e) {
+      showError(e);
+      clearQCheck.disabled = false;
+      clearQCheck.checked = false;
+    }
+  };
+
+  const clearQRow = qCount > 0
+    ? el('label', { class: 'row small', style: 'margin-top:10px;gap:8px' },
+      clearQCheck,
+      el('span', {},
+        `Lift quarantine from ${plural(qCount, 'group')} before this round`,
+        el('span', { class: 'dim' }, ' — lets them participate again')))
+    : null;
+
   const dryRun = async () => {
     roundPick.plan = await post('/api/rounds/dry-run', { businessId: roundPick.businessId, adId: roundPick.adId });
     await viewRounds();
@@ -1633,7 +1679,7 @@ async function viewRounds() {
 
   const startRound = async () => {
     const auto = s.defaultRunnerMode === 'auto';
-    const ok = await confirmDialog(`Start a round of “${chosenAd.name}”?`,
+    const ok = await confirmDialog(`Start a round of "${chosenAd.name}"?`,
       `${plural(plan.posts.length, 'group')}, ${s.roundMinGapMinutes}–${s.roundMaxGapMinutes} minutes apart. ` +
       (auto ? 'AUTO: it posts to every eligible group without asking you. ' : 'Assisted: it stops at each group and waits for you to click Post. ') +
       'Keep this window and the browser open until it finishes.',
@@ -1652,7 +1698,18 @@ async function viewRounds() {
       s.roundDailyCap === null ? 'no daily ceiling' : `ceiling ${s.roundDailyCap} posts / day`),
     state.round?.postedToday ? el('span', { class: 'tag accent' }, `${state.round.postedToday} round posts today`) : null,
     state.round?.queued ? el('span', { class: 'tag accent' }, `${state.round.queued} still queued`) : null,
-    btn('Change in Safety', () => go('settings'), { kind: 'ghost', size: 'sm', icon: 'arrow' }));
+    qCount > 0 ? el('span', { class: 'tag bad' }, `${plural(qCount, 'group')} quarantined`) : null,
+    btn('Change in Safety', () => go('settings'), { kind: 'ghost', size: 'sm', icon: 'arrow' }),
+    btn('Reset rest timers', async () => {
+      const ok = await confirmDialog('Reset all round limits?',
+        'This resets the round rest timers for every group. They will become eligible for another round immediately.',
+        'Reset timers', 'danger');
+      if (!ok) return;
+      await post('/api/rounds/reset-limits', {});
+      flash('Round rest timers reset.', 'ok');
+      roundPick.plan = null;
+      await viewRounds();
+    }, { kind: 'ghost', size: 'sm', icon: 'rotate', title: 'Reset the rest period for all groups' }));
 
   let previewBody;
   if (!plan) {
@@ -1684,6 +1741,7 @@ async function viewRounds() {
     callout('warn', 'Members will see the same business several times a day.',
       'Whether that costs you the groups is a judgement about your groups, not something the tool can check. What still applies inside a round:'),
     rulesStrip,
+    clearQRow,
     el('div', { style: 'height:16px' }),
 
     card('Send a round', { icon: 'repeat' },

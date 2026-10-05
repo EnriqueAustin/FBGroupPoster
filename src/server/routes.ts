@@ -172,6 +172,24 @@ export function registerRoutes(
     return ids.map((id) => updateGroup(id, patch));
   });
 
+  /**
+   * Clear quarantine from every currently quarantined group.
+   *
+   * Used from the Rounds screen so a round can reach groups that were
+   * automatically quarantined after a failure. The quarantine fields are
+   * nulled; nothing else changes (active, composer, cooldowns, etc.).
+   */
+  app.post('/api/groups/clear-quarantine', () => {
+    const nowIso = new Date().toISOString();
+    const quarantined = store.groups.list().filter(
+      (g) => g.quarantinedUntil && Date.parse(g.quarantinedUntil) > Date.parse(nowIso),
+    );
+    for (const g of quarantined) {
+      store.groups.update(g.id, { quarantinedUntil: null, quarantineReason: null });
+    }
+    return { cleared: quarantined.length };
+  });
+
   app.get('/api/businesses/:id/assignments', (req) => {
     const { id } = parseParams(idParam, req);
     must(store.businesses.get(id), 'business');
@@ -401,6 +419,11 @@ export function registerRoutes(
     return { committed: commitRound(store, plan).length, plan };
   });
 
+  app.post('/api/rounds/reset-limits', () => {
+    const cleared = store.log.resetRoundLimits();
+    return { cleared };
+  });
+
   // --- jobs: browser work driven from the UI ---------------------------------
   const jobs = createJobRunner();
 
@@ -585,12 +608,17 @@ export function registerRoutes(
     const upcoming = waiting.filter((q) => q.scheduledFor > nowIso)
       .sort((a, b) => a.scheduledFor.localeCompare(b.scheduledFor));
 
+    const quarantined = groups.filter(
+      (g) => g.quarantinedUntil && Date.parse(g.quarantinedUntil) > Date.parse(nowIso),
+    ).length;
+
     return {
       settings: s,
       counts: {
         businesses: store.businesses.list().length,
         groupsTotal: groups.length,
         groupsActive: groups.filter((g) => g.active).length,
+        groupsQuarantined: quarantined,
         ads: store.ads.list().length,
         queuePending: waiting.length,
         queueDueNow: dueNow.length,
