@@ -107,6 +107,11 @@ export interface RouteOptions {
   mediaDir?: string;
   /** The app-wide job runner, shared with every other module. */
   jobs?: JobRunner;
+  /**
+   * Images other modules keep in the same media folder (e.g. Instagram message
+   * images). Media cleanup must treat them as in use, or it would delete them.
+   */
+  otherReferencedImages?: () => string[];
 }
 
 const cleanupBody = z.object({
@@ -123,6 +128,7 @@ export function registerRoutes(
 ): void {
   const mediaDir = opts.mediaDir ?? MEDIA_DIR;
   const jobs = opts.jobs ?? createJobRunner();
+  const inUse = () => [...referencedImagePaths(store), ...(opts.otherReferencedImages?.() ?? [])];
 
   // --- businesses ------------------------------------------------------------
   app.get('/api/businesses', () => store.businesses.list());
@@ -549,7 +555,7 @@ export function registerRoutes(
 
   app.get('/api/media/unused', async (req) => {
     const { diagnosticsOlderThanDays } = parseQuery(unusedQuery, req);
-    const files = await findUnusedMedia({ mediaDir, referenced: referencedImagePaths(store) });
+    const files = await findUnusedMedia({ mediaDir, referenced: inUse() });
     const diagnostics = await findOldDiagnostics({ mediaDir, olderThanDays: diagnosticsOlderThanDays });
     return {
       files, diagnostics, diagnosticsOlderThanDays,
@@ -566,7 +572,7 @@ export function registerRoutes(
     // but a sweep mid-run is the one moment a mistake here costs a real post.
     if (jobs.current()) throw badRequest('a job is running — wait for it to finish before cleaning up media');
     const images = await deleteMediaFiles(mediaDir,
-      await findUnusedMedia({ mediaDir, referenced: referencedImagePaths(store) }));
+      await findUnusedMedia({ mediaDir, referenced: inUse() }));
     const diagnostics = includeDiagnostics
       ? await deleteMediaFiles(mediaDir, await findOldDiagnostics({ mediaDir, olderThanDays: diagnosticsOlderThanDays }))
       : { deleted: 0, bytes: 0, skipped: [] as string[] };

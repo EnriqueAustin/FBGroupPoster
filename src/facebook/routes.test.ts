@@ -400,9 +400,12 @@ test('media unused is a dry run; cleanup deletes only unreferenced files and old
   const store = openStore(':memory:');
   const app = Fastify();
   installErrorHandler(app);
-  registerRoutes(app, store, createScheduler(store), { mediaDir });
+  // Stands in for an Instagram message image: another module's file in the same folder.
+  const otherModuleImage = path.join(mediaDir, '3-instagram.png');
+  registerRoutes(app, store, createScheduler(store), { mediaDir, otherReferencedImages: () => [otherModuleImage] });
   try {
     const kept = put('1-kept.png', 'kk', 2);
+    put('3-instagram.png', 'ig', 2);
     put('2-orphan.png', 'ooo', 2);
     put(path.join('diagnostics', 'old.png'), 'dddd', 60);
     put(path.join('diagnostics', 'new.png'), 'n', 1);
@@ -428,6 +431,7 @@ test('media unused is a dry run; cleanup deletes only unreferenced files and old
     assert.equal(first.deletedDiagnostics, 0);
     assert.equal(first.bytesFreed, 3);
     assert.ok(existsSync(kept), 'an image an inactive variant references is kept');
+    assert.ok(existsSync(otherModuleImage), 'an image another module references is kept');
     assert.ok(existsSync(path.join(mediaDir, 'diagnostics', 'old.png')));
 
     const second = json(await app.inject({

@@ -1,7 +1,9 @@
 # Instagram campaign DMs — plan
 
-Status: **planned, not built.** This is the design to build against, in the
-same spirit as the Facebook module: assisted first, slow on purpose, stop the
+Status: **steps 1–2 built** — domain, store, planner and lead lifecycle,
+all tested, no browser yet. Next: step 3 (sign-in + collect-only harvest).
+
+Same spirit as the Facebook module: assisted first, slow on purpose, stop the
 moment the platform pushes back.
 
 ## The idea
@@ -23,13 +25,13 @@ the automation is secondary.
 
 | Risk | Rule |
 |---|---|
-| Volume spikes | Daily caps, defaults **30 follows / 15 DMs**, settings not constants. New accounts start lower. |
+| Volume spikes | Daily caps, defaults **25 follows / 12 DMs / 80 profile visits**, settings not constants. |
 | Machine cadence | Random gaps between actions (default 3–9 min), active hours only. |
-| Cold DMs land in Message Requests and get reported | **Follow first, DM 24–48h later.** Optional "only DM people who followed back". |
+| Cold DMs land in Message Requests and get reported | **Follow first.** DM soon after a follow-back, otherwise 24–48h after the follow. |
 | Identical text to many people | Message variants with rotation, `{first_name}` placeholder, no back-to-back repeats. **No links in the first message.** |
 | Messaging the same person twice | Global contacted registry: a username is contacted **once ever**, across all campaigns. |
 | Ignoring warnings | "Action blocked", "Try again later", "We restrict certain activity", `/challenge/` → **IG circuit breaker trips**, everything IG stops until you clear it. Separate from the FB breaker. |
-| Wrecking the main business account | Recommend a separate, warmed-up account. Automating follows/DMs breaks Instagram's terms; plan for the account being at risk. |
+| Losing the main business account | It runs on the main account by choice, so every other rule here is set conservatively. Automating follows/DMs breaks Instagram's terms; the account is at some risk regardless. |
 
 Also worth knowing: unsolicited direct marketing can fall under POPIA's
 direct-marketing rules. Keeping the first message conversational and always
@@ -38,19 +40,30 @@ keeps this on the right side of both the law and the spam filters.
 
 ## Data model (own tables, own `ig_schema_version`)
 
+Code: `domain/types.ts`, `store/migrate.ts`, `store/sqlite-store.ts`.
+
 - **ig_campaigns** — name, active, source handles, posts per source (default 1),
-  max likers per post, follow-first (bool), DM delay hours (min/max),
-  filters (see below), message variants.
-- **ig_message_variants** — campaign, text, weight, active.
-- **ig_leads** — username (**globally unique**), display name, campaign,
-  source handle, source post URL, status, skip reason, timestamps
-  (`harvested_at`, `followed_at`, `dm_due_at`, `messaged_at`, `replied_at`).
-  Status: `new → skipped | follow_queued → followed → dm_queued → messaged →
-  replied | opted_out | failed`.
-- **ig_action_log** — every follow / DM / profile visit / harvest with outcome.
-  The daily caps are counted from here, exactly like FB's `post_log`.
-- **ig_settings** — caps, gaps, active hours, DM delay, mode
-  (`assisted` | `auto`), breaker state.
+  max leads per post, likers/commenters toggles, DM delay hours (min/max),
+  filters (JSON).
+- **ig_message_variants** — campaign, text (`{first_name}`, `{username}`),
+  optional image, weight, active.
+- **ig_leads** — username (**globally unique** — this is the contacted
+  registry), display name, campaign (RESTRICT: a campaign with leads can only
+  be deactivated, never deleted), source, status, skip reason, timestamps incl.
+  `followed_back_at` and `dm_due_at`, variant sent, attempts.
+  Status: `new → followed → messaged → replied`, or `skipped | opted_out | failed`.
+- **ig_actions** — every follow / DM / profile visit / harvest / check with
+  outcome. The daily caps are counted from here, exactly like FB's `post_log`.
+- **ig_settings** — single JSON row of overrides merged over
+  `DEFAULT_IG_SETTINGS`, so new settings need no migration.
+
+Logic: `planner/planner.ts` (what's next and when — caps, gaps, active hours,
+DM/follow alternation, variant rotation, round-robin across campaigns),
+`planner/lifecycle.ts` (every lead status change, paired with its action-log
+row), `planner/filters.ts`, `planner/messages.ts`.
+
+FB's media cleanup is told about IG variant images (`otherReferencedImages`),
+so it never deletes them.
 
 ## Filters
 
@@ -100,9 +113,12 @@ gaps, breaker).
 6. **Auto mode + reply tracking** (check inbox, mark `replied`, stop the
    sequence for that lead).
 
-## Open questions
+## Decisions
 
-- One IG account for this, or your main business account? (Recommend separate.)
-- Likers, commenters, or both?
-- Should a DM wait for a follow-back, or go out after the delay regardless?
-- First message: plain text only, or allow an image?
+- **Account:** the main business account. Defaults are therefore conservative
+  (25 follows / 12 DMs a day) — raise them slowly, and only while nothing has
+  pushed back. A block here costs the account customers already know.
+- **Who:** likers **and** commenters.
+- **When to DM:** as soon as a follow-back is seen (30–180 min after it), and in
+  any case 24–48h after the follow even with no follow-back.
+- **Message:** text, with an optional image per variant (sent after the text).

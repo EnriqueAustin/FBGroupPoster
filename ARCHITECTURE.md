@@ -92,7 +92,7 @@ facebook/          the group poster
   orchestrator.ts  The run loop + circuit breaker.
   routes.ts        Fastify API.
   cli/             Terminal entry points.
-instagram/         (planned) campaign DMs
+instagram/         campaign DMs: domain, store, planner (runner + UI in progress)
 server/main.ts     Wires core + modules together; 127.0.0.1 only.
 cli/backup.ts      Snapshot of the whole database.
 web/               Local UI, no build step.

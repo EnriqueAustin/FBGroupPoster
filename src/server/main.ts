@@ -20,6 +20,7 @@ import { registerJobRoutes } from '../core/job-routes.ts';
 import { openStore } from '../facebook/store/sqlite-store.ts';
 import { createScheduler } from '../facebook/scheduler/planner.ts';
 import { registerRoutes as registerFacebookRoutes, MEDIA_DIR } from '../facebook/routes.ts';
+import { openIgStore } from '../instagram/store/sqlite-store.ts';
 
 const HOST = '127.0.0.1';
 // Overridable so a second instance can run alongside the real one — pair it
@@ -32,6 +33,8 @@ const webRoot = path.join(here, '..', 'web');
 
 const store = openStore(DB_PATH);
 const scheduler = createScheduler(store);
+// Same database file, own tables (ig_*) and own migration history.
+const igStore = openIgStore(DB_PATH);
 // One runner for every module: only one job may drive the browser at a time.
 const jobs = createJobRunner();
 
@@ -48,11 +51,16 @@ await app.register(fastifyStatic, {
 
 installErrorHandler(app);
 registerJobRoutes(app, jobs);
-registerFacebookRoutes(app, store, scheduler, { jobs });
+registerFacebookRoutes(app, store, scheduler, {
+  jobs,
+  otherReferencedImages: () => igStore.variants.list()
+    .map((v) => v.imagePath).filter((p): p is string => p !== null),
+});
 
 const shutdown = async () => {
   await app.close();
   store.close();
+  igStore.close();
   process.exit(0);
 };
 process.on('SIGINT', shutdown);
