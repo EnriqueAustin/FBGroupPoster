@@ -6,16 +6,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import Fastify from 'fastify';
-import { openStore } from '../store/sqlite-store.ts';
-import { createScheduler } from '../scheduler/planner.ts';
+import { openStore } from './store/sqlite-store.ts';
+import { createScheduler } from './scheduler/planner.ts';
 import { registerRoutes } from './routes.ts';
-import { WRONG_COMPOSER_QUARANTINE_REASON } from '../orchestrator.ts';
-import { startOfDayUtcMs } from '../scheduler/time.ts';
-import type { Store } from '../domain/contracts.ts';
+import { installErrorHandler } from '../core/http.ts';
+import { WRONG_COMPOSER_QUARANTINE_REASON } from './orchestrator.ts';
+import { startOfDayUtcMs } from '../core/time.ts';
+import type { Store } from './domain/contracts.ts';
 
 function build() {
   const store = openStore(':memory:');
   const app = Fastify();
+  installErrorHandler(app);
   registerRoutes(app, store, createScheduler(store));
   return { app, store };
 }
@@ -397,6 +399,7 @@ test('media unused is a dry run; cleanup deletes only unreferenced files and old
 
   const store = openStore(':memory:');
   const app = Fastify();
+  installErrorHandler(app);
   registerRoutes(app, store, createScheduler(store), { mediaDir });
   try {
     const kept = put('1-kept.png', 'kk', 2);

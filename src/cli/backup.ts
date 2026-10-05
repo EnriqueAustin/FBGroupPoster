@@ -10,7 +10,7 @@
 import Database from 'better-sqlite3';
 import { mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
-import { DB_PATH } from '../config.ts';
+import { DB_PATH } from '../core/config.ts';
 
 const KEEP = 20;
 const DIR = path.join('data', 'backups');

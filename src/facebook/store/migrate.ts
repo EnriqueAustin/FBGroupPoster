@@ -14,12 +14,9 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import type { Database } from 'better-sqlite3';
-
-interface Migration {
-  version: number;
-  name: string;
-  up(db: Database): void;
-}
+import {
+  currentVersion as coreCurrentVersion, latestVersion, runMigrations, type Migration,
+} from '../../core/migrations.ts';
 
 /**
  * schema.sql sits next to this module in src/, but `tsc` does not copy non-TS
@@ -30,7 +27,7 @@ function readSchemaSql(): string {
   const here = dirname(fileURLToPath(import.meta.url));
   const candidates = [
     join(here, 'schema.sql'),
-    join(here, '..', '..', 'src', 'store', 'schema.sql'),
+    join(here, '..', '..', '..', 'src', 'facebook', 'store', 'schema.sql'),
   ];
   for (const candidate of candidates) {
     try {
@@ -93,40 +90,18 @@ const MIGRATIONS: Migration[] = [
   },
 ];
 
-export const LATEST_SCHEMA_VERSION: number =
-  MIGRATIONS.reduce((max, m) => (m.version > max ? m.version : max), 0);
+// Facebook's history lives in the original `schema_version` table: renaming it
+// would make every existing database re-run migration 1.
+const VERSION_TABLE = 'schema_version';
+
+export const LATEST_SCHEMA_VERSION: number = latestVersion(MIGRATIONS);
 
 /** Highest applied version, or 0 on a database that has never been migrated. */
 export function currentVersion(db: Database): number {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS schema_version (
-      version    INTEGER PRIMARY KEY,
-      name       TEXT NOT NULL,
-      applied_at TEXT NOT NULL
-    )
-  `);
-  const row = db
-    .prepare<[], { version: number | null }>('SELECT MAX(version) AS version FROM schema_version')
-    .get();
-  return row?.version ?? 0;
+  return coreCurrentVersion(db, VERSION_TABLE);
 }
 
 /** Applies every pending migration. Returns the versions actually applied. */
 export function migrate(db: Database): number[] {
-  const from = currentVersion(db);
-  const pending = MIGRATIONS.filter((m) => m.version > from).sort((a, b) => a.version - b.version);
-  if (pending.length === 0) return [];
-
-  const record = db.prepare(
-    'INSERT INTO schema_version (version, name, applied_at) VALUES (?, ?, ?)',
-  );
-  // One transaction per migration: a failure half-way leaves the earlier ones
-  // committed and correctly recorded, rather than silently rolling them back.
-  for (const m of pending) {
-    db.transaction(() => {
-      m.up(db);
-      record.run(m.version, m.name, new Date().toISOString());
-    })();
-  }
-  return pending.map((m) => m.version);
+  return runMigrations(db, VERSION_TABLE, MIGRATIONS);
 }

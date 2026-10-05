@@ -12,7 +12,8 @@
  */
 
 export type JobStatus = 'running' | 'done' | 'failed' | 'cancelled';
-export type JobKind = 'bootstrap' | 'post-run';
+/** Namespaced per module, e.g. 'bootstrap', 'post-run', 'ig-campaign'. */
+export type JobKind = string;
 
 /** A question the job is blocked on, surfaced to the UI. */
 export interface JobPrompt {
@@ -54,8 +55,9 @@ export function createJobRunner() {
   const cancelling = new Set<string>();
   let counter = 0;
 
-  /** Only one browser job at a time — two Chrome instances on one profile
-   *  corrupt it, and two posting runs would blow through the daily cap. */
+  /** Only one browser job at a time, across ALL modules — FB and IG share one
+   *  Chrome profile, two Chrome instances on one profile corrupt it, and two
+   *  posting runs would blow through the daily cap. */
   const activeKinds = new Set<JobKind>();
 
   function start(kind: JobKind, fn: (h: JobHandle) => Promise<unknown>): Job {

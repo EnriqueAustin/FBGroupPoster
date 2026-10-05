@@ -8,7 +8,7 @@ import {
   matchBlock, isAccountWide, selectBlockText, selectStatusText, isWrongComposerFailure, WRONG_COMPOSER_TAG,
 } from './detect.ts';
 import { resultAfterPosting, resultBeforeComposing, resultFromError } from './playwright-runner.ts';
-import { decideLoggedIn } from './browser.ts';
+import { decideLoggedIn } from './auth.ts';
 import { SELECTORS } from './composers.ts';
 import { guessComposerType, parseGroupId, parseMemberCount, mergeDiscovered } from './discover-groups.ts';
 
@@ -156,7 +156,7 @@ test('merging keeps one row per group and the richer data', () => {
 // cookie first made the tool declare success mid-2FA, scrape nothing, and close
 // the browser window while the user was reaching for their phone.
 
-const signals = (over: Partial<import('./browser.ts').AuthSignals> = {}) => ({
+const signals = (over: Partial<import('./auth.ts').AuthSignals> = {}) => ({
   url: 'https://www.facebook.com/',
   hasLoginForm: false,
   bodyText: 'News Feed',

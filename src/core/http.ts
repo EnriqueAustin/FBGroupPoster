@@ -5,7 +5,7 @@
  * result. Anything that throws an `HttpError` is turned into a JSON error body
  * by the app-level error handler.
  */
-import type { FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { ZodTypeAny, output as ZodOutput } from 'zod';
 import { ZodError } from 'zod';
 
@@ -73,6 +73,11 @@ export function sendError(reply: FastifyReply, err: unknown): FastifyReply {
   }
   const message = err instanceof Error ? err.message : String(err);
   return reply.code(500).send({ error: message, details: null });
+}
+
+/** App-wide: every module's routes report errors the same way. Call once. */
+export function installErrorHandler(app: FastifyInstance): void {
+  app.setErrorHandler((err, _req, reply) => { sendError(reply, err); });
 }
 
 /** Require a row the store may not have; keeps handlers to one line. */

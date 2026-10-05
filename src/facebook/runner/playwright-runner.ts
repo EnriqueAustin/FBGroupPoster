@@ -9,7 +9,7 @@ import { createInterface } from 'node:readline/promises';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { PostJob, PostResult, Runner } from '../domain/contracts.ts';
-import { firstPage, launchBrowser, type RunnerBrowser } from './browser.ts';
+import { firstPage, launchBrowser, type RunnerBrowser } from '../../core/browser.ts';
 import {
   detectBlock, isAccountWide, isWrongComposerMessage, WRONG_COMPOSER_TAG, type BlockResult,
 } from './detect.ts';

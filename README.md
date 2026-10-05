@@ -8,4 +8,4 @@ npx playwright install chrome
 npm start
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) and [src/runner/README.md](src/runner/README.md).
+See [ARCHITECTURE.md](ARCHITECTURE.md) and [src/facebook/runner/README.md](src/facebook/runner/README.md), and for the Instagram module [src/instagram/PLAN.md](src/instagram/PLAN.md).

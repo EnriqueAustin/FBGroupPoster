@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, symlinkSync, utimesSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { openStore } from '../store/sqlite-store.ts';
+import { openStore } from './store/sqlite-store.ts';
 import {
   deleteMediaFiles, findOldDiagnostics, findUnusedMedia, mediaKey, referencedImagePaths,
 } from './media-gc.ts';

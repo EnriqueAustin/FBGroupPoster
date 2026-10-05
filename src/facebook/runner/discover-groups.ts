@@ -9,7 +9,8 @@ import type { DiscoveredGroup, GroupDiscoverer } from '../domain/contracts.ts';
 import type { ComposerType } from '../domain/types.ts';
 import path from 'node:path';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { FACEBOOK_GROUPS_JOINED, FACEBOOK_HOME, firstPage, isLoggedIn, launchBrowser, login } from './browser.ts';
+import { firstPage, launchBrowser } from '../../core/browser.ts';
+import { FACEBOOK_GROUPS_JOINED, FACEBOOK_HOME, isLoggedIn, login } from './auth.ts';
 
 export interface DiscoverOptions {
   projectRoot?: string;

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { openStore } from '../store/sqlite-store.ts';
 import { createScheduler } from './planner.ts';
-import { localHour } from './time.ts';
+import { localHour } from '../../core/time.ts';
 import type { Store } from '../domain/contracts.ts';
 import type { Id } from '../domain/types.ts';
 

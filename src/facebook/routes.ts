@@ -6,15 +6,15 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
-import type { Scheduler, Store } from '../domain/contracts.ts';
-import { badRequest, must, parseBody, parseOr400, parseParams, parseQuery, sendError } from './http.ts';
-import { createJobRunner } from './jobs.ts';
-import { importGroups } from '../bootstrap.ts';
-import { createGroupDiscoverer } from '../runner/discover-groups.ts';
-import { createRunner } from '../runner/playwright-runner.ts';
-import { createOrchestrator, WRONG_COMPOSER_QUARANTINE_REASON } from '../orchestrator.ts';
-import { commitRound, planRound } from '../scheduler/rounds.ts';
-import { startOfDayUtcMs, toIso } from '../scheduler/time.ts';
+import type { Scheduler, Store } from './domain/contracts.ts';
+import { badRequest, must, parseBody, parseOr400, parseParams, parseQuery } from '../core/http.ts';
+import { createJobRunner, type JobRunner } from '../core/jobs.ts';
+import { importGroups } from './bootstrap.ts';
+import { createGroupDiscoverer } from './runner/discover-groups.ts';
+import { createRunner } from './runner/playwright-runner.ts';
+import { createOrchestrator, WRONG_COMPOSER_QUARANTINE_REASON } from './orchestrator.ts';
+import { commitRound, planRound } from './scheduler/rounds.ts';
+import { startOfDayUtcMs, toIso } from '../core/time.ts';
 import {
   DEFAULT_DIAGNOSTICS_DAYS, deleteMediaFiles, findOldDiagnostics, findUnusedMedia, referencedImagePaths,
 } from './media-gc.ts';
@@ -105,6 +105,8 @@ export const MEDIA_DIR = path.join('data', 'media');
 export interface RouteOptions {
   /** Where uploads live. Overridable so tests never touch the real data/media. */
   mediaDir?: string;
+  /** The app-wide job runner, shared with every other module. */
+  jobs?: JobRunner;
 }
 
 const cleanupBody = z.object({
@@ -120,7 +122,7 @@ export function registerRoutes(
   app: FastifyInstance, store: Store, scheduler: Scheduler, opts: RouteOptions = {},
 ): void {
   const mediaDir = opts.mediaDir ?? MEDIA_DIR;
-  app.setErrorHandler((err, _req, reply) => { sendError(reply, err); });
+  const jobs = opts.jobs ?? createJobRunner();
 
   // --- businesses ------------------------------------------------------------
   app.get('/api/businesses', () => store.businesses.list());
@@ -425,14 +427,7 @@ export function registerRoutes(
   });
 
   // --- jobs: browser work driven from the UI ---------------------------------
-  const jobs = createJobRunner();
-
-  app.get('/api/jobs', () => jobs.list().map((j) => ({ ...j, lines: j.lines.slice(-5) })));
-  app.get('/api/jobs/current', () => jobs.current());
-  app.get('/api/jobs/:id', (req) => {
-    const id = String((req.params as { id: string }).id);
-    return must(jobs.get(id), 'job');
-  });
+  // Polling, answering and stopping jobs is generic: see core/job-routes.ts.
 
   app.post('/api/jobs/bootstrap', () =>
     jobs.start('bootstrap', async (h) => {
@@ -538,17 +533,6 @@ export function registerRoutes(
       const horizonMs = (s.roundMaxGapMinutes + 5) * 60_000;
       return orchestrator.runDue(items.length, horizonMs);
     });
-  });
-
-  app.post('/api/jobs/:id/respond', (req) => {
-    const id = String((req.params as { id: string }).id);
-    const { answer } = parseBody(z.object({ answer: z.string() }), req);
-    return jobs.respond(id, answer);
-  });
-
-  app.post('/api/jobs/:id/cancel', (req) => {
-    const id = String((req.params as { id: string }).id);
-    return jobs.cancel(id);
   });
 
   // --- media cleanup ---------------------------------------------------------

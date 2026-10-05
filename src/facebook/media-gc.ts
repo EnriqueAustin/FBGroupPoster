@@ -18,7 +18,7 @@
  */
 import { lstat, readdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
-import type { Store } from '../domain/contracts.ts';
+import type { Store } from './domain/contracts.ts';
 
 export interface MediaFile {
   /** mediaDir joined with the file name, in the same form mediaDir was given. */

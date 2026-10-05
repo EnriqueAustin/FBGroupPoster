@@ -11,11 +11,11 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/server/main.ts",
     "start": "tsx src/server/main.ts",
-    "bootstrap": "tsx src/cli/bootstrap-groups.ts",
-    "plan": "tsx src/cli/plan.ts",
-    "run": "tsx src/cli/run.ts",
+    "bootstrap": "tsx src/facebook/cli/bootstrap-groups.ts",
+    "plan": "tsx src/facebook/cli/plan.ts",
+    "run": "tsx src/facebook/cli/run.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx --test src/**/*.test.ts",
+    "test": "tsx --test \"src/**/*.test.ts\"",
     "backup": "tsx src/cli/backup.ts"
   },
   "dependencies": {

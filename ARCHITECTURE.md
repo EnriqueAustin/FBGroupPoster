@@ -39,7 +39,7 @@ version treated that snapshot as authoritative, so switching to auto left every
 already-queued post assisted and the run still stopped to ask. Changing the
 setting now also re-stamps everything still waiting.
 
-Auto mode clicks Post through `submitPost()` in `runner/composers.ts`, which
+Auto mode clicks Post through `submitPost()` in `facebook/runner/composers.ts`, which
 searches **inside the composer dialog**, waits for the button to be *enabled*
 (Facebook greys it out until the image upload finishes), and treats the dialog
 closing as the receipt. If it cannot confirm that, the post is reported failed
@@ -74,18 +74,38 @@ hand, and refusing at 21:05 would only be obstructive. It says so and proceeds.
 
 ## Shape
 
+The app is a shell with one module per platform. Facebook is the first; an
+Instagram module is being added (see `src/instagram/PLAN.md`).
+
 ```
-domain/      types + interfaces. Depends on nothing.
-store/       SQLite persistence behind the Store interface.
-scheduler/   Decides what gets posted where and when. Pure, seeded, testable.
-runner/      Playwright. Two composers: normal status, marketplace listing.
-orchestrator The run loop + circuit breaker.
-server/      Fastify API on 127.0.0.1 only.
-web/         Local UI, no build step.
+core/              shared, platform-agnostic
+  browser.ts       persistent Chrome profile + wait-for-the-human sign-in loop
+  jobs.ts          background jobs (one browser job at a time, app-wide)
+  job-routes.ts    poll / answer / stop a job
+  migrations.ts    per-module migration runner (one version table per module)
+  http.ts rng.ts time.ts config.ts
+facebook/          the group poster
+  domain/          types + interfaces. Depends on nothing.
+  store/           SQLite persistence behind the Store interface.
+  scheduler/       Decides what gets posted where and when. Pure, seeded, testable.
+  runner/          Playwright. Two composers: normal status, marketplace listing.
+  orchestrator.ts  The run loop + circuit breaker.
+  routes.ts        Fastify API.
+  cli/             Terminal entry points.
+instagram/         (planned) campaign DMs
+server/main.ts     Wires core + modules together; 127.0.0.1 only.
+cli/backup.ts      Snapshot of the whole database.
+web/               Local UI, no build step.
 ```
 
-Modules talk only through `domain/contracts.ts`. The scheduler has never heard
-of SQLite; the runner has never heard of the scheduler.
+Inside a module, parts talk only through its `domain/contracts.ts`: the
+scheduler has never heard of SQLite; the runner has never heard of the
+scheduler. Modules never import each other — anything two modules need lives
+in `core/`.
+
+All modules share **one database file** (each owns its own tables and its own
+version table), **one Chrome profile** (sign in to each site once) and **one job
+runner** (so FB and IG can never drive the browser at the same time).
 
 ## The safety rules, and why each exists
 
