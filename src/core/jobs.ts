@@ -24,9 +24,23 @@ export interface JobPrompt {
   context?: Record<string, unknown>;
 }
 
+/**
+ * Which browser a job drives. Jobs in different lanes run side by side; a
+ * second job in a busy lane is refused. A lane is one identity, because each
+ * identity has its own Chrome profile (see profileDirFor) and a profile can
+ * only be open once.
+ */
+export interface JobLane {
+  key: string;
+  /** Shown in the UI so two running jobs can be told apart. */
+  label: string;
+}
+
 export interface Job {
   id: string;
   kind: JobKind;
+  lane: string;
+  label: string;
   status: JobStatus;
   lines: string[];
   startedAt: string;
@@ -55,22 +69,28 @@ export function createJobRunner() {
   const cancelling = new Set<string>();
   let counter = 0;
 
-  /** Only one browser job at a time, across ALL modules — FB and IG share one
-   *  Chrome profile, two Chrome instances on one profile corrupt it, and two
-   *  posting runs would blow through the daily cap. */
-  const activeKinds = new Set<JobKind>();
+  /**
+   * One job per lane — two Chrome instances on one profile corrupt it, and two
+   * posting runs in one lane would blow through that identity's daily cap. A
+   * lane is one Chrome profile: each Facebook identity has one, and Instagram
+   * has its own, so IG work can run beside a Facebook round.
+   */
+  const activeLanes = new Map<string, JobKind>();
 
-  function start(kind: JobKind, fn: (h: JobHandle) => Promise<unknown>): Job {
-    if (activeKinds.size > 0) {
-      throw new Error(`another job (${[...activeKinds].join(', ')}) is already running`);
+  const DEFAULT_LANE: JobLane = { key: 'default', label: '' };
+
+  function start(kind: JobKind, fn: (h: JobHandle) => Promise<unknown>, lane: JobLane = DEFAULT_LANE): Job {
+    const busy = activeLanes.get(lane.key);
+    if (busy) {
+      throw new Error(`another job (${busy}${lane.label ? ` as ${lane.label}` : ''}) is already running — stop it first`);
     }
     const id = `job-${++counter}-${Date.now().toString(36)}`;
     const job: Job = {
-      id, kind, status: 'running', lines: [], startedAt: new Date().toISOString(),
+      id, kind, lane: lane.key, label: lane.label, status: 'running', lines: [], startedAt: new Date().toISOString(),
       endedAt: null, error: null, result: null, awaiting: null,
     };
     jobs.set(id, job);
-    activeKinds.add(kind);
+    activeLanes.set(lane.key, kind);
 
     const handle: JobHandle = {
       log(msg) {
@@ -106,7 +126,7 @@ export function createJobRunner() {
         job.awaiting = null;
         pending.delete(id);
         cancelling.delete(id);
-        activeKinds.delete(kind);
+        activeLanes.delete(lane.key);
       }
     })();
 
@@ -142,6 +162,10 @@ export function createJobRunner() {
     get: (id: string) => jobs.get(id) ?? null,
     list: () => [...jobs.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt)),
     current: () => [...jobs.values()].find((j) => j.status === 'running') ?? null,
+    /** Every running job, oldest first — one per busy lane. */
+    running: () => [...jobs.values()].filter((j) => j.status === 'running')
+      .sort((a, b) => a.startedAt.localeCompare(b.startedAt)),
+    laneBusy: (key: string) => activeLanes.has(key),
   };
 }
 

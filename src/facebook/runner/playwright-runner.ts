@@ -9,11 +9,14 @@ import { createInterface } from 'node:readline/promises';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { PostJob, PostResult, Runner } from '../domain/contracts.ts';
-import { firstPage, launchBrowser, type RunnerBrowser } from '../../core/browser.ts';
+import { firstPage, launchBrowser, profileDirFor, type RunnerBrowser } from '../../core/browser.ts';
+import { FACEBOOK_HOME, isLoggedIn } from './auth.ts';
 import {
   detectBlock, isAccountWide, isWrongComposerMessage, WRONG_COMPOSER_TAG, type BlockResult,
 } from './detect.ts';
 import { composerFor, submitPost, waitForPageReady, ComposerError } from './composers.ts';
+import { ensureIdentity } from './identity.ts';
+import type { Identity } from '../domain/types.ts';
 
 export interface RunnerOptions {
   projectRoot?: string;
@@ -27,6 +30,23 @@ export interface RunnerOptions {
    * decided so a graphical caller can show it properly.
    */
   askHuman?: (prompt: string, context?: Record<string, unknown>) => Promise<string>;
+  /**
+   * Asked when the browser cannot be switched into a post's identity
+   * automatically. Resolve true once the human has switched by hand. Defaults
+   * to stdin.
+   */
+  askSwitch?: (identity: Identity) => Promise<boolean>;
+  /**
+   * Whose Chrome profile to open (see profileDirFor). Omitted = the personal
+   * profile's, which is where every run went before Pages had their own.
+   */
+  identity?: Identity;
+  /**
+   * Asked when the profile opens signed out — the first run in a Page's own
+   * profile always does. Resolve true once the human has signed in. Without
+   * it, a signed-out profile ends the run before anything is attempted.
+   */
+  confirmSignIn?: () => Promise<boolean>;
 }
 
 const DIAGNOSTICS_DIR = path.join('data', 'media', 'diagnostics');
@@ -110,7 +130,15 @@ export function resultFromError(message: string, screenshotPath?: string): PostR
 export function createRunner(opts: RunnerOptions = {}): Runner {
   const log = opts.log ?? ((m: string) => console.log(m));
   const ask = opts.askHuman ?? askOnStdin;
+  const askSwitch = opts.askSwitch ?? (async (identity: Identity) => (await askOnStdin(
+    `  Switch the browser to ${identity.name} yourself (avatar menu, top right), then press Enter — or type q to give up: `,
+  )) !== 'q');
   let browser: RunnerBrowser | null = null;
+  /**
+   * Page ids learned during this run, so a Page whose id was not yet stored
+   * is verified by id from its second post on instead of switched again.
+   */
+  const learned = new Map<number, string>();
 
   async function screenshot(name: string): Promise<string | undefined> {
     if (!browser) return undefined;
@@ -127,14 +155,66 @@ export function createRunner(opts: RunnerOptions = {}): Runner {
 
   return {
     async start() {
-      browser = await launchBrowser({ projectRoot: opts.projectRoot, slowMoMs: opts.slowMoMs, log });
+      browser = await launchBrowser({
+        profileDir: profileDirFor(opts.identity, opts.projectRoot), slowMoMs: opts.slowMoMs, log,
+      });
+      // Checked once, up front: a signed-out session would otherwise fail every
+      // post in the run one by one, each looking like a broken composer.
+      const page = await firstPage(browser.context);
+      await page.goto(FACEBOOK_HOME, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      if (await isLoggedIn(page)) return;
+      log(`Sign in to Facebook in the Chrome window${opts.identity ? ` for ${opts.identity.name}` : ''} — `
+        + 'each identity has its own Chrome profile, so this is needed once per identity.');
+      if (!opts.confirmSignIn || !(await opts.confirmSignIn())) {
+        await browser.close();
+        browser = null;
+        throw new Error('run cancelled: the browser is not signed in to Facebook');
+      }
     },
 
     async post(job: PostJob): Promise<PostResult> {
       if (!browser) throw new Error('runner.start() must be called before post()');
       const page = await firstPage(browser.context);
+      let learnedFbPageId: string | undefined;
 
       try {
+        // Become the right identity BEFORE opening the group. Not being able to
+        // confirm it is a failure of this item, never a reason to post anyway.
+        if (job.identity) {
+          const known = learned.get(job.identity.id);
+          const identity = known && !job.identity.fbPageId ? { ...job.identity, fbPageId: known } : job.identity;
+          const sw = await ensureIdentity(browser.context, page, identity, { log, askHuman: askSwitch });
+          if (!sw.ok) return { outcome: 'failed', error: sw.error };
+          if (sw.learnedFbPageId) {
+            learned.set(job.identity.id, sw.learnedFbPageId);
+            learnedFbPageId = sw.learnedFbPageId;
+          }
+        }
+
+        const withLearned = (r: PostResult): PostResult => (learnedFbPageId ? { ...r, learnedFbPageId } : r);
+        return withLearned(await composeAndPost());
+      } catch (err) {
+        const stamp = `fail-group-${job.group.id}-${Date.now()}`;
+        const shot = await screenshot(stamp);
+        const message = err instanceof ComposerError ? err.message
+          : err instanceof Error ? err.message : String(err);
+
+        // Write the full text alongside the image. The message now carries a
+        // list of what the page actually offers, which is too long to read in
+        // a table cell but is exactly what fixing a selector needs.
+        try {
+          mkdirSync(DIAGNOSTICS_DIR, { recursive: true });
+          writeFileSync(path.join(DIAGNOSTICS_DIR, `${stamp}.txt`),
+            `group: ${job.group.name}\nurl: ${job.group.url}\nad: ${job.ad.name}\n`
+            + `as: ${job.identity?.name ?? '(not specified)'}\n\n${message}\n`);
+        } catch { /* diagnostics are best-effort */ }
+
+        log(`    FAILED: ${message}`);
+        const failed = resultFromError(message, shot);
+        return learnedFbPageId ? { ...failed, learnedFbPageId } : failed;
+      }
+
+      async function composeAndPost(): Promise<PostResult> {
         await page.goto(job.group.url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
 
         // domcontentloaded fires while Facebook is still showing its splash
@@ -153,12 +233,13 @@ export function createRunner(opts: RunnerOptions = {}): Runner {
 
         if (job.mode === 'assisted') {
           log('');
-          log(`  READY TO POST — ${job.group.name}`);
+          log(`  READY TO POST — ${job.group.name}${job.identity ? ` (as ${job.identity.name})` : ''}`);
           if (job.group.rulesNotes.trim()) log(`  GROUP RULES: ${job.group.rulesNotes.trim()}`);
           log('  Review it in the browser, then post it yourself.');
           const answer = await ask('  [Enter] = I posted it   |   s = skip   |   q = stop the run: ', {
             groupName: job.group.name,
             groupUrl: job.group.url,
+            postingAs: job.identity?.name ?? null,
             rulesNotes: job.group.rulesNotes,
             adName: job.ad.name,
             caption: job.variant.caption,
@@ -183,23 +264,6 @@ export function createRunner(opts: RunnerOptions = {}): Runner {
         await submitPost(page, log);
 
         return resultAfterPosting(await detectBlock(page), page.url());
-      } catch (err) {
-        const stamp = `fail-group-${job.group.id}-${Date.now()}`;
-        const shot = await screenshot(stamp);
-        const message = err instanceof ComposerError ? err.message
-          : err instanceof Error ? err.message : String(err);
-
-        // Write the full text alongside the image. The message now carries a
-        // list of what the page actually offers, which is too long to read in
-        // a table cell but is exactly what fixing a selector needs.
-        try {
-          mkdirSync(DIAGNOSTICS_DIR, { recursive: true });
-          writeFileSync(path.join(DIAGNOSTICS_DIR, `${stamp}.txt`),
-            `group: ${job.group.name}\nurl: ${job.group.url}\nad: ${job.ad.name}\n\n${message}\n`);
-        } catch { /* diagnostics are best-effort */ }
-
-        log(`    FAILED: ${message}`);
-        return resultFromError(message, shot);
       }
     },
 

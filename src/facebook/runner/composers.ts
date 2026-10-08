@@ -120,11 +120,40 @@ export async function typeHumanely(locator: Locator, text: string): Promise<void
     // Newlines go BETWEEN lines only. The first version pressed one after every
     // line including the last, so every caption went out with a trailing blank
     // line. Shift+Enter rather than Enter keeps a newline from submitting.
+    // Spotting the list proved unreliable: even after waiting for it, the
+    // newline accepted "Coast To Coast Waterproofing" for "Coast" and "Samantha
+    // Calla Barratt" for "Call" (2026-10-06). So the newline is first inserted
+    // without a key press at all (see insertLineBreak), which the suggestion
+    // list never hears. Shift+Enter is only the fallback for editors that
+    // ignore that.
     if (i < lines.length - 1) {
+      if (await insertLineBreak(locator)) continue;
+      await pause(500, 900);
       await dismissTypeahead(locator);
       await locator.press('Shift+Enter').catch(() => undefined);
     }
   }
+}
+
+/**
+ * Add a line break at the caret by sending the editor the input event a line
+ * break produces, rather than a key press. Facebook's editor (Lexical) turns
+ * that event straight into a line break, while its tag-suggestion list only
+ * acts on the Enter/Tab keys, so an open suggestion is left alone; the next
+ * line's text then closes it. Returns false when the editor ignored the event
+ * (no new line appeared), so the caller can fall back to a key press.
+ */
+async function insertLineBreak(box: Locator): Promise<boolean> {
+  // Lexical commits its DOM changes asynchronously, so wait before comparing;
+  // misreading a handled event as ignored would add a second, blank line.
+  return box.evaluate(async (el) => {
+    const before = el.innerHTML;
+    el.dispatchEvent(new InputEvent('beforeinput', {
+      inputType: 'insertLineBreak', bubbles: true, cancelable: true, composed: true,
+    }));
+    await new Promise((r) => setTimeout(r, 120));
+    return el.innerHTML !== before;
+  }).catch(() => false);
 }
 
 /** Whether a mention/typeahead suggestion list is open for `box`. */
@@ -137,7 +166,7 @@ async function typeaheadOpen(box: Locator): Promise<boolean> {
       if (active && visible(document.getElementById(active))) return true;
       const controls = el.getAttribute('aria-controls');
       if (controls && visible(document.getElementById(controls))) return true;
-      return Array.from(document.querySelectorAll('[role="listbox"]')).some(visible);
+      return Array.from(document.querySelectorAll('[role="listbox"], [role="option"]')).some(visible);
     });
   } catch {
     return false;
@@ -161,6 +190,36 @@ async function insertedMentions(box: Locator): Promise<string[]> {
   return box.evaluate((el) => Array.from(
     el.querySelectorAll('a[href], [data-mention], [data-lexical-mention], [data-testid*="mention" i]'),
   ).map((m) => (m.textContent ?? '').trim()).filter(Boolean)).catch(() => []);
+}
+
+/**
+ * Why the text in the composer is not what was typed, or null when it is. Only
+ * letters and digits are compared: emoji, spacing and line breaks render
+ * differently in Facebook's editor, but an accepted tag suggestion always
+ * changes the words ("Coast" -> "Coast To Coast Waterproofing"). This catches
+ * that however Facebook marks the tag up, which insertedMentions did not.
+ */
+export function typedTextMismatch(expected: string, actual: string): string | null {
+  const words = (s: string) => s.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+  const want = words(expected);
+  const got = words(actual);
+  let i = 0;
+  while (i < want.length && want[i] === got[i]) i++;
+  if (i === want.length && got.length === want.length) return null;
+  return `expected "${want.slice(i, i + 4).join(' ')}", found "${got.slice(i, i + 4).join(' ')}"`;
+}
+
+/** Stop the post when Facebook changed the words typed into `box`. */
+async function assertTypedAsIs(box: Locator, text: string, what: string): Promise<void> {
+  const actual = await box.evaluate((el) => (el as HTMLElement).innerText ?? el.textContent ?? '')
+    .catch(() => null);
+  if (actual === null) return;
+  const why = typedTextMismatch(text, actual);
+  if (why) {
+    throw new ComposerError(`the ${what} changed while typing (${why})`,
+      'nothing was posted. Facebook most likely turned a word into a tag of a page or '
+      + 'person — check the screenshot in data/media/diagnostics');
+  }
 }
 
 /** True when a textbox's accessible name marks it as a comment/reply box. */
@@ -651,6 +710,7 @@ export async function statusComposer(ctx: ComposerContext): Promise<void> {
       'nothing was posted. Facebook turned words of the caption into @-mentions while '
       + 'typing — check the screenshot in data/media/diagnostics');
   }
+  await assertTypedAsIs(box, variant.caption, 'caption');
   log('    caption typed');
 
   await attachImages(page, dialog, variant.imagePaths, log);
@@ -711,6 +771,9 @@ export async function listingComposer(ctx: ComposerContext): Promise<void> {
     if (!value) return;
     const field = await firstVisible(scope, 'textbox', patterns, what);
     await typeHumanely(field, value);
+    // Only the free-text fields: Facebook reformats the price and the location
+    // keeps its own dropdown on purpose.
+    if (what === 'title' || what === 'description') await assertTypedAsIs(field, value, what);
     log(`    ${what} set`);
   };
 

@@ -51,7 +51,7 @@ test('elements the app looks up by id exist in the HTML', () => {
   const js = readFileSync(path.join(here, 'app.js'), 'utf8');
 
   // Ids the app creates itself at render time; only static ones must be present.
-  const dynamic = new Set(['job-console', 'job-status']);
+  const dynamic = new Set(['job-list']);
   const ids = new Set([...js.matchAll(/getElementById\('([\w-]+)'\)/g)].map((m) => m[1]!));
 
   for (const id of ids) {

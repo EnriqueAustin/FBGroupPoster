@@ -37,10 +37,20 @@ export function currentVersion(db: Database, table: string): number {
   return row?.version ?? 0;
 }
 
-/** Applies every pending migration. Returns the versions actually applied. */
-export function runMigrations(db: Database, table: string, migrations: readonly Migration[]): number[] {
+/**
+ * Applies every pending migration. Returns the versions actually applied.
+ * `upTo` stops early — only tests use it, to build a database as an older
+ * install had it and then check the upgrade.
+ */
+export function runMigrations(
+  db: Database,
+  table: string,
+  migrations: readonly Migration[],
+  upTo: number = Infinity,
+): number[] {
   const from = currentVersion(db, table);
-  const pending = migrations.filter((m) => m.version > from).sort((a, b) => a.version - b.version);
+  const pending = migrations.filter((m) => m.version > from && m.version <= upTo)
+    .sort((a, b) => a.version - b.version);
   if (pending.length === 0) return [];
 
   const record = db.prepare(

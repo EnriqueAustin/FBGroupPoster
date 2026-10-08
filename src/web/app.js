@@ -181,6 +181,13 @@ const relTime = (iso) => {
 /** Uploaded images are stored as data/media/<file> and served at /media/<file>. */
 const mediaUrl = (p) => `/media/${String(p).split(/[\\/]/).pop()}`;
 
+function openLightbox(src) {
+  const bg = el('div', { class: 'lightbox', onclick: () => bg.remove() });
+  bg.appendChild(el('img', { src, alt: '' }));
+  document.addEventListener('keydown', function esc(e) { if (e.key === 'Escape') { bg.remove(); document.removeEventListener('keydown', esc); } });
+  document.body.appendChild(bg);
+}
+
 const AVATAR_COLORS = ['#6366f1', '#0ea5e9', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6'];
 const avatar = (name, id) => el('span', {
   class: 'avatar', style: `background:${AVATAR_COLORS[id % AVATAR_COLORS.length]}`,
@@ -285,14 +292,23 @@ async function promptDialog(title, label, value = '') {
 const state = {
   businesses: [], groups: [], ads: [], settings: null, counts: {},
   nextDueAt: null, round: null, assignments: new Map(),
+  // Who posts can go out as (the profile first, then Pages), and who is a
+  // member of which group: groupId -> Map(identityId -> membership).
+  identities: [], memberships: new Map(),
 };
 
 async function refreshCore() {
-  const [businesses, groups, ads, summary] = await Promise.all([
+  const [businesses, groups, ads, summary, identities, memberships] = await Promise.all([
     get('/api/businesses'), get('/api/groups'), get('/api/ads'), get('/api/summary'),
+    get('/api/identities'), get('/api/memberships'),
   ]);
+  const byGroup = new Map();
+  for (const m of memberships) {
+    if (!byGroup.has(m.groupId)) byGroup.set(m.groupId, new Map());
+    byGroup.get(m.groupId).set(m.identityId, m);
+  }
   Object.assign(state, {
-    businesses, groups, ads,
+    businesses, groups, ads, identities, memberships: byGroup,
     settings: summary.settings, counts: summary.counts, nextDueAt: summary.nextDueAt ?? null,
     round: summary.round ?? null,
   });
@@ -335,6 +351,25 @@ function applyAssignments() {
 }
 
 const nameOf = (id, list) => list.find((x) => x.id === id)?.name ?? `#${id}`;
+
+/** Who a business posts as. Null identityId = the personal profile. */
+const identityOf = (biz) => state.identities.find((i) => i.id === biz.identityId)
+  ?? state.identities.find((i) => i.kind === 'profile');
+
+/**
+ * Why `identity` cannot post in this group, or null if it can. Mirrors the
+ * server's membership check so the Groups table warns before a plan does.
+ */
+const memberProblem = (groupId, identity) => {
+  if (!identity) return null;
+  const m = state.memberships.get(groupId)?.get(identity.id);
+  if (!m) return `${identity.name} has not joined this group`;
+  if (!m.active) return `${identity.name} was not found here on the last import`;
+  if (m.quarantinedUntil && new Date(m.quarantinedUntil) > new Date()) {
+    return `${identity.name} is quarantined here: ${m.quarantineReason ?? ''}`;
+  }
+  return null;
+};
 /**
  * A group name that opens the group on Facebook in a new tab. Used by every
  * table that names a group, so a post you need to go and delete by hand is one
@@ -370,9 +405,20 @@ document.getElementById('clear-breaker').onclick = async () => {
 
 let jobTimer = null;
 let modalOpen = false;
+/** The job the open review modal answers for — several can be running. */
+let modalJobId = null;
+/** Ids of the jobs running at the last poll, to notice one finishing. */
+let lastRunningIds = new Set();
 
 const modalRoot = document.getElementById('modal-root');
-const closeModal = () => { modalRoot.replaceChildren(); modalOpen = false; };
+const closeModal = () => { modalRoot.replaceChildren(); modalOpen = false; modalJobId = null; };
+
+/** Every running job (one per identity at most). Never throws. */
+const fetchRunningJobs = () => get('/api/jobs/running').catch(() => []);
+
+/** Is a job as this identity already going? Each identity is its own lane. */
+const laneBusy = (jobs, identityId) => jobs.some((j) => j.lane === `identity-${identityId}`);
+const jobTitle = (job) => `${job.kind === 'bootstrap' ? 'Importing groups' : 'Posting run'}${job.label ? ` as ${job.label}` : ''}`;
 
 /**
  * Assisted posting blocks here. The caption and the group's own rules are shown
@@ -382,9 +428,11 @@ const closeModal = () => { modalRoot.replaceChildren(); modalOpen = false; };
 function openReviewModal(job) {
   if (modalOpen) return;
   modalOpen = true;
+  modalJobId = job.id;
   const p = job.awaiting;
   const c = p.context ?? {};
   const isSignIn = c.kind === 'sign-in';
+  const isSwitch = c.kind === 'switch-identity';
 
   const buttons = p.options.map((o, i) => el('button', {
     class: (o.value === 'cancel' || o.value === 'q') ? 'btn danger-outline' : i === 0 ? 'btn big' : 'btn secondary',
@@ -403,7 +451,17 @@ function openReviewModal(job) {
       el('p', { class: 'hint' },
         'Press continue only once you can see your normal Facebook feed — not the code screen. ' +
         'This app never sees your password; you type it into Chrome yourself.'))
+    : isSwitch
+    ? el('div', { class: 'body' },
+      el('p', {}, p.question),
+      c.pageUrl ? el('p', {}, el('a', { href: c.pageUrl, target: '_blank', rel: 'noreferrer', class: 'row small' },
+        `${c.identity}'s Page`, icon('external'))) : null,
+      callout('info', 'Nothing posts until this is confirmed.',
+        'After you continue, the app checks that the browser really is acting as ' +
+        `${c.identity}. If it is not, this post fails instead of going out under the wrong name.`))
     : el('div', { class: 'body' },
+      c.postingAs ? callout('info', `Posting as ${c.postingAs}`,
+        'Check the composer in the browser shows this name before you click Post.') : null,
       c.rulesNotes ? callout('warn', 'Group rules', c.rulesNotes) : null,
       el('div', { class: 'row', style: 'margin-bottom:8px' },
         el('strong', {}, c.adName ?? 'Post'),
@@ -420,40 +478,63 @@ function openReviewModal(job) {
   modalRoot.replaceChildren(el('div', { class: 'modal-back' },
     el('div', { class: 'modal', role: 'dialog' },
       el('header', {},
-        el('h2', {}, isSignIn ? 'Waiting for you to sign in' : (c.groupName ?? 'Ready to post')),
-        isSignIn ? null : el('p', {}, p.question)),
+        el('h2', {}, isSignIn ? 'Waiting for you to sign in'
+          : isSwitch ? `Switch to ${c.identity}` : (c.groupName ?? 'Ready to post')),
+        // With two runs going, say which one is asking — and so which Chrome
+        // window to look at.
+        job.label ? el('p', { class: 'small dim' }, jobTitle(job)) : null,
+        isSignIn || isSwitch ? null : el('p', {}, p.question)),
       body,
       el('footer', {}, ...buttons))));
 }
 
-function setFootJob(job) {
+function setFootJob(jobs) {
   const foot = document.getElementById('foot-job');
+  const waiting = jobs.some((j) => j.awaiting);
+  const only = jobs.length === 1 ? jobs[0] : null;
   foot.replaceChildren(
-    el('span', { class: `dot ${job ? (job.awaiting ? 'bad' : 'live') : ''}` }),
-    el('span', {}, !job ? 'Idle' : job.awaiting ? 'Waiting for you' : job.kind === 'bootstrap' ? 'Importing groups…' : 'Posting run active'));
-  foot.style.cursor = job ? 'pointer' : '';
-  foot.onclick = job ? () => go('setup') : null;
+    el('span', { class: `dot ${jobs.length ? (waiting ? 'bad' : 'live') : ''}` }),
+    el('span', {}, !jobs.length ? 'Idle' : waiting ? 'Waiting for you'
+      : only ? (only.kind === 'bootstrap' ? 'Importing groups…' : 'Posting run active')
+        : `${jobs.length} runs active`));
+  foot.style.cursor = jobs.length ? 'pointer' : '';
+  foot.onclick = jobs.length ? () => go('setup') : null;
 }
 
 async function pollJob() {
-  let job = null;
-  try { job = await get('/api/jobs/current'); } catch { /* server restarting */ }
+  let jobs = [];
+  try { jobs = await get('/api/jobs/running'); } catch { /* server restarting */ }
 
-  const console_ = document.getElementById('job-console');
-  if (console_ && job) {
-    const atBottom = console_.scrollHeight - console_.scrollTop - console_.clientHeight < 40;
-    console_.textContent = job.lines.join('\n');
-    if (atBottom) console_.scrollTop = console_.scrollHeight;
+  const list = document.getElementById('job-list');
+  if (list) {
+    // Same jobs as on screen: update in place so a console the human has
+    // scrolled up in stays put. A job started or finished: rebuild.
+    const shown = [...list.querySelectorAll('[data-job]')].map((n) => n.dataset.job);
+    if (shown.join() !== jobs.map((j) => j.id).join()) list.replaceChildren(...jobBlocks(jobs));
+    for (const job of jobs) {
+      const block = list.querySelector(`[data-job="${job.id}"]`);
+      const console_ = block?.querySelector('.console');
+      if (console_) {
+        const atBottom = console_.scrollHeight - console_.scrollTop - console_.clientHeight < 40;
+        console_.textContent = job.lines.join('\n');
+        if (atBottom) console_.scrollTop = console_.scrollHeight;
+      }
+      block?.querySelector('.job-status')?.replaceChildren(jobStatusNode(job));
+    }
   }
-  const status = document.getElementById('job-status');
-  if (status) status.replaceChildren(jobStatusNode(job));
-  setFootJob(job);
+  setFootJob(jobs);
 
-  if (job?.awaiting) openReviewModal(job);
-  else if (!job && modalOpen) closeModal();
+  // One question at a time. When two runs both wait, the second one's modal
+  // opens on the poll after the first is answered.
+  const asking = jobs.find((j) => j.awaiting);
+  if (modalOpen && !jobs.some((j) => j.id === modalJobId && j.awaiting)) closeModal();
+  if (asking) openReviewModal(asking);
 
-  if (!job && jobTimer) {
-    clearInterval(jobTimer); jobTimer = null;
+  const ids = new Set(jobs.map((j) => j.id));
+  const finished = [...lastRunningIds].some((id) => !ids.has(id));
+  lastRunningIds = ids;
+  if (!jobs.length && jobTimer) { clearInterval(jobTimer); jobTimer = null; }
+  if (finished) {
     await refreshCore();
     // Never throw away unsaved edits on Safety just because a run finished.
     if (!settingsDirty()) await render();
@@ -466,7 +547,7 @@ function jobStatusNode(job) {
   if (!job) return el('span', { class: 'row small dim' }, el('span', { class: 'dot' }), 'Idle');
   return el('span', { class: 'row' },
     el('span', { class: `pill ${job.awaiting ? 'waiting' : job.status}` }, job.awaiting ? 'waiting for you' : job.status),
-    el('span', { class: 'muted small' }, job.kind === 'bootstrap' ? 'Importing groups' : 'Posting run'),
+    el('span', { class: 'muted small' }, jobTitle(job)),
     btn('Stop', () => post(`/api/jobs/${job.id}/cancel`, {}), { kind: 'danger-outline', size: 'sm', icon: 'stop' }),
   );
 }
@@ -477,10 +558,19 @@ async function startJob(url, body) {
   await pollJob();
 }
 
-const activityCard = (job) => card('Activity', {
-  sub: 'Live output from the browser',
-  actions: [el('span', { id: 'job-status' }, jobStatusNode(job))],
-}, el('pre', { class: 'console', id: 'job-console' }, job ? job.lines.join('\n') : ''));
+/** One console per running job; an empty console when nothing runs. */
+const jobBlocks = (jobs) => (jobs.length
+  ? jobs.map((job) => el('div', { class: 'job-block', 'data-job': job.id },
+    el('div', { class: 'job-status' }, jobStatusNode(job)),
+    el('pre', { class: 'console' }, job.lines.join('\n'))))
+  : [el('div', { class: 'job-block' },
+    el('div', { class: 'job-status' }, jobStatusNode(null)),
+    el('pre', { class: 'console' }, ''))]);
+
+const activityCard = (jobs) => card('Activity', {
+  sub: jobs.length > 1 ? `${jobs.length} runs side by side — each in its own Chrome window` : 'Live output from the browser',
+}, el('div', { id: 'job-list' }, ...jobBlocks(jobs)));
+
 
 // -------------------------------------------------------------- dashboard ---
 
@@ -602,8 +692,10 @@ const heroCard = (eyebrow, title, text, ...acts) => el('div', { class: 'hero' },
 // ------------------------------------------------------------------ setup ---
 
 async function viewSetup() {
-  const job = await get('/api/jobs/current').catch(() => null);
-  if (job) startPolling();
+  const jobs = await fetchRunningJobs();
+  if (jobs.length) startPolling();
+  const importId = importPick.identityId ?? state.identities[0]?.id;
+  const runAs = state.identities.find((i) => i.id === runPick.identityId) ?? state.identities.find((i) => i.kind === 'profile');
   const s = state.settings, c = state.counts;
   const due = c.queueDueNow ?? 0, queued = c.queuePending ?? 0;
 
@@ -620,9 +712,19 @@ async function viewSetup() {
         el('p', { class: 'hint' },
           'Opens Chrome and reads the list of groups you belong to. Nothing is posted, and your ' +
           'curation (active, composer, rules, businesses) is kept. It waits up to 10 minutes for you to sign in, including 2FA.'),
+        state.identities.length > 1
+          ? el('p', { class: 'hint' },
+            'Each identity has its own groups — a Page has to join a group itself. Importing as a Page ' +
+            'switches Chrome into the Page first and records only the groups it is in.')
+          : null,
         el('div', { class: 'row gap3 mt4' },
-          btn('Import groups from Facebook', () => startJob('/api/jobs/bootstrap'),
-            { icon: 'download', kind: c.groupsTotal ? 'secondary' : '', disabled: !!job }),
+          state.identities.length > 1
+            ? select(importId, state.identities.map((i) => [i.id, i.name]),
+              (v) => { importPick.identityId = Number(v); viewSetup(); }, { style: 'width:auto;min-width:170px' })
+            : null,
+          btn('Import groups from Facebook', () => startJob('/api/jobs/bootstrap',
+            importPick.identityId ? { identityId: importPick.identityId } : {}),
+          { icon: 'download', kind: c.groupsTotal ? 'secondary' : '', disabled: laneBusy(jobs, importId) }),
           el('span', { class: 'dim small' }, `${plural(c.groupsTotal, 'group')} in the registry`))),
 
       card('Start a posting run', {
@@ -654,19 +756,110 @@ async function viewSetup() {
               }, { size: 'sm', icon: 'forward' }) : null))
             : null,
 
+        // A run works through one identity's posts in that identity's own
+        // Chrome window, so a run as the Page can go beside one as the profile.
+        state.identities.length > 1
+          ? el('label', { class: 'row small mt4', style: 'gap:8px' }, 'Post as',
+            select(runAs?.id, state.identities.map((i) => [i.id, i.kind === 'page' ? `${i.name} (Page)` : i.name]),
+              (v) => { runPick.identityId = Number(v); viewSetup(); }, { style: 'width:auto;min-width:170px' }),
+            laneBusy(jobs, runAs?.id) ? el('span', { class: 'tag accent' }, 'already running') : null)
+          : null,
         el('div', { class: 'row mt4' },
           ...[1, 3, 5, 15].map((n) => btn(n === 1 ? 'Post just one' : `Up to ${n}`,
-            () => startJob('/api/jobs/post-run', { max: n }), {
+            () => startJob('/api/jobs/post-run', { max: n, ...(runAs ? { identityId: runAs.id } : {}) }), {
               kind: n === 1 ? '' : 'secondary',
               icon: n === 1 ? 'send' : undefined,
-              disabled: s.breakerTripped || due === 0 || !!job,
+              disabled: s.breakerTripped || due === 0 || laneBusy(jobs, runAs?.id),
             }))),
         el('p', { class: 'hint tight mt2' }, 'Start small — one post, then read the log.')),
     ),
 
-    activityCard(job),
+    identitiesCard(jobs),
+    activityCard(jobs),
   );
-  if (job) pollJob();
+  if (jobs.length) pollJob();
+}
+
+/** Which identity the import button reads groups for. Survives re-renders. */
+const importPick = { identityId: null };
+/** Which identity a posting run on Setup posts as. Null = the profile. */
+const runPick = { identityId: null };
+
+/**
+ * Your profile and the Pages it manages. A business picks one of these on the
+ * Ads screen; posts then go out as it.
+ */
+function identitiesCard(jobs) {
+  const reload = async (msg) => { await refreshCore(); await render(); if (msg) flash(msg, 'ok'); };
+
+  const rows = state.identities.map((i) => {
+    const businesses = state.businesses.filter((b) => identityOf(b)?.id === i.id);
+    return el('div', { class: 'biz-row' },
+      avatar(i.name, i.id),
+      el('div', { style: 'flex:1;min-width:0' },
+        el('div', { class: 'row', style: 'gap:8px' },
+          el('span', { style: 'font-weight:600' }, i.name),
+          el('span', { class: `tag ${i.kind === 'page' ? 'accent' : ''}` }, i.kind === 'page' ? 'Page' : 'Profile')),
+        el('div', { class: 'dim small' },
+          `${plural(i.groupCount, 'group')} joined · `,
+          businesses.length ? `posts for ${businesses.map((b) => b.name).join(', ')}` : 'no business posts as it',
+          i.pageUrl ? el('span', {}, ' · ', el('a', { href: i.pageUrl, target: '_blank', rel: 'noreferrer' }, 'open Page')) : null)),
+      i.kind === 'page' && i.groupCount === 0
+        ? el('span', { class: 'tag warn', title: 'Join groups as the Page on Facebook, then import them here.' }, 'no groups yet')
+        : null,
+      btn('Import groups', () => { importPick.identityId = i.id; return startJob('/api/jobs/bootstrap', { identityId: i.id }); },
+        { kind: 'secondary', size: 'sm', icon: 'download', disabled: laneBusy(jobs, i.id), title: `Read the groups ${i.name} has joined` }),
+      i.kind === 'page' ? btn('', async () => {
+        const name = await promptDialog('Rename Page', 'Name shown in this app', i.name);
+        if (!name || name === i.name) return;
+        await patch(`/api/identities/${i.id}`, { name });
+        await reload('Renamed.');
+      }, { kind: 'ghost', size: 'sm', icon: 'edit', title: 'Rename' }) : null,
+      i.kind === 'page' ? btn('', async () => {
+        const url = await promptDialog('Page address', 'facebook.com address of the Page', i.pageUrl ?? '');
+        if (!url || url === i.pageUrl) return;
+        await patch(`/api/identities/${i.id}`, { pageUrl: url });
+        await reload('Page address updated.');
+      }, { kind: 'ghost', size: 'sm', icon: 'external', title: 'Change the Page address' }) : null,
+      i.kind === 'page' ? btn('', async () => {
+        const ok = await confirmDialog(`Remove ${i.name}?`,
+          `Its group memberships are forgotten${businesses.length ? ` and ${businesses.map((b) => b.name).join(', ')} will post as your profile again` : ''}. ` +
+          'Post history is kept. Nothing changes on Facebook.', 'Remove', 'danger');
+        if (!ok) return;
+        await api('DELETE', `/api/identities/${i.id}`);
+        if (importPick.identityId === i.id) importPick.identityId = null;
+        await reload(`${i.name} removed.`);
+      }, { kind: 'ghost', size: 'sm', icon: 'trash', title: 'Remove' }) : null);
+  });
+
+  return card('Posting identities', {
+    icon: 'users',
+    sub: 'Your profile, and the Facebook Pages it manages',
+  },
+    el('p', { class: 'hint' },
+      'To post as a Page, add it here, join groups as the Page on Facebook (many groups do not allow Pages), ' +
+      'import its groups, then choose it under "Posts as" for a business on the Ads screen. ' +
+      'Chrome switches into the Page before each post — no second login.'),
+    el('div', {}, rows),
+    el('form', {
+      class: 'row mt4',
+      onsubmit: async (e) => {
+        e.preventDefault();
+        const f = e.target.elements;
+        const name = f.name.value.trim(), pageUrl = f.pageUrl.value.trim();
+        if (!name) { f.name.classList.add('invalid'); f.name.focus(); return; }
+        if (!pageUrl) { f.pageUrl.classList.add('invalid'); f.pageUrl.focus(); return; }
+        const b = e.target.querySelector('button');
+        b.disabled = true;
+        try { await post('/api/identities', { name, pageUrl }); await reload(`Added ${name}.`); }
+        catch (err) { showError(err); b.disabled = false; }
+      },
+    },
+      el('input', { type: 'text', name: 'name', placeholder: 'Page name', style: 'max-width:200px',
+        oninput: (e) => e.target.classList.remove('invalid') }),
+      el('input', { type: 'text', inputMode: 'url', name: 'pageUrl', placeholder: 'https://www.facebook.com/yourpage', style: 'max-width:320px',
+        oninput: (e) => e.target.classList.remove('invalid') }),
+      el('button', { class: 'btn', type: 'submit' }, icon('plus'), 'Add Page')));
 }
 
 // ----------------------------------------------------------------- groups ---
@@ -677,7 +870,7 @@ async function viewSetup() {
  * being applied. Previously the filter survived but the search box came back
  * empty, which made most of the groups look like they had vanished.
  */
-const gFilter = { text: '', business: '', composer: '', active: '' };
+const gFilter = { text: '', business: '', composer: '', active: '', member: '' };
 const gSelected = new Set();
 
 async function viewGroups() {
@@ -688,7 +881,7 @@ async function viewGroups() {
   const counter = el('span', { class: 'dim small' });
   const bulk = el('div', { class: 'bulkbar', hidden: true });
   const clearBtn = btn('Clear filters', () => {
-    Object.assign(gFilter, { text: '', business: '', composer: '', active: '' });
+    Object.assign(gFilter, { text: '', business: '', composer: '', active: '', member: '' });
     viewGroups();
   }, { kind: 'ghost', size: 'sm', icon: 'x' });
 
@@ -705,6 +898,11 @@ async function viewGroups() {
       (v) => { gFilter.composer = v; draw(); }, { style: 'width:auto;min-width:140px' }),
     select(gFilter.active, [['', 'Any state'], ['1', 'Active'], ['0', 'Inactive']],
       (v) => { gFilter.active = v; draw(); }, { style: 'width:auto;min-width:120px' }),
+    // Only worth showing once there is more than the profile to choose from.
+    state.identities.length > 1
+      ? select(gFilter.member, [['', 'Any identity'], ...state.identities.map((i) => [String(i.id), `Joined as ${i.name}`])],
+        (v) => { gFilter.member = v; draw(); }, { style: 'width:auto;min-width:150px' })
+      : null,
     clearBtn,
     el('span', { class: 'spacer' }),
     counter);
@@ -712,7 +910,8 @@ async function viewGroups() {
   mount(
     pageHead('Groups',
       'Marketplace groups need the listing composer (title and price); normal groups take a plain ' +
-      'caption. A group only receives ads from the businesses assigned to it.'),
+      'caption. A group only receives ads from the businesses assigned to it — and only if the identity ' +
+      'that business posts as has joined it.'),
     state.groups.length === 0
       ? card(null, {}, empty('users', 'No groups yet', 'Import the groups you belong to from Facebook. Nothing is posted.',
         btn('Go to Setup & Run', () => go('setup'), { icon: 'download' })))
@@ -721,10 +920,15 @@ async function viewGroups() {
 
   if (state.groups.length === 0) return;
 
+  // A removed Page can still be the remembered filter; drop it rather than
+  // showing an empty table with no visible reason.
+  if (gFilter.member && !state.identities.some((i) => String(i.id) === gFilter.member)) gFilter.member = '';
+
   function visible() {
     const q = gFilter.text.trim().toLowerCase();
     return state.groups.filter((g) =>
       (!q || g.name.toLowerCase().includes(q))
+      && (!gFilter.member || !!state.memberships.get(g.id)?.get(Number(gFilter.member))?.active)
       && (!gFilter.composer || g.composerType === gFilter.composer)
       && (gFilter.active === '' || String(g.active ? 1 : 0) === gFilter.active)
       && (!gFilter.business
@@ -784,7 +988,25 @@ async function viewGroups() {
         el('div', { class: 'meta' },
           g.memberCount != null ? `${g.memberCount.toLocaleString()} members` : 'members unknown',
           quarantined ? el('span', { class: 'tag bad', title: g.quarantineReason ?? '' },
-            `quarantined until ${fmtTime(g.quarantinedUntil)}`) : null))),
+            `quarantined until ${fmtTime(g.quarantinedUntil)}`) : null,
+          // Which Pages are in this group. The profile is left unsaid — it is
+          // the normal case — unless an import found it gone.
+          ...(state.identities.length > 1 ? state.identities.map((i) => {
+            const m = state.memberships.get(g.id)?.get(i.id);
+            if (!m) return null;
+            const q = m.quarantinedUntil && new Date(m.quarantinedUntil) > new Date();
+            if (q) {
+              return el('button', {
+                class: 'tag bad', title: `${m.quarantineReason ?? ''} — click to clear`,
+                onclick: async () => {
+                  await put('/api/memberships', { groupId: g.id, identityId: i.id, clearQuarantine: true });
+                  await refreshCore(); draw();
+                },
+              }, `${i.name}: quarantined until ${fmtTime(m.quarantinedUntil)}`);
+            }
+            if (!m.active) return el('span', { class: 'tag warn', title: 'Not found here on the last import' }, `${i.name}: left`);
+            return i.kind === 'page' ? el('span', { class: 'tag accent', title: `${i.name} has joined this group` }, i.name) : null;
+          }) : [])))),
       el('td', { class: 'tight' }, select(g.composerType, [['status', 'Normal'], ['listing', 'Marketplace']],
         (v) => save({ composerType: v }).catch(showError), { style: 'width:136px' })),
       el('td', { class: 'tight' }, el('div', { class: 'chips' },
@@ -792,8 +1014,14 @@ async function viewGroups() {
           ? el('a', { href: '#ads', class: 'small' }, 'Add a business first')
           : state.businesses.map((b) => {
             const on = (g._businesses ?? []).includes(b.id);
+            // Assigned, but the business's identity cannot post here: say so
+            // now rather than leaving it to a plan exclusion later.
+            const problem = on ? memberProblem(g.id, identityOf(b)) : null;
             return el('button', {
-              class: `chip${on ? ' on' : ''}`, title: on ? `Unassign ${b.name}` : `Assign ${b.name}`,
+              class: `chip${on ? ' on' : ''}`,
+              style: problem ? 'color:var(--warn)' : '',
+              title: problem ? `${b.name} will be skipped here — ${problem}. Click to unassign.`
+                : on ? `Unassign ${b.name}` : `Assign ${b.name}`,
               onclick: async (e) => {
                 const chip = e.currentTarget;
                 chip.disabled = true;
@@ -808,7 +1036,7 @@ async function viewGroups() {
                   next.classList.add('saved');
                 } catch (err) { showError(err); chip.disabled = false; }
               },
-            }, icon(on ? 'check' : 'plus'), b.name);
+            }, icon(problem ? 'alert' : on ? 'check' : 'plus'), b.name);
           }))),
       el('td', { class: 'tight' }, el('input', {
         type: 'number', min: '0', value: g.cooldownDaysOverride ?? '',
@@ -877,6 +1105,21 @@ function viewAds() {
           el('div', { style: 'flex:1;min-width:0' },
             el('div', { style: 'font-weight:600' }, b.name),
             el('div', { class: 'dim small' }, `${plural(ads.length, 'ad')} · ${plural(ads.reduce((n, a) => n + activeVariants(a).length, 0), 'active variant')}`)),
+          // Who this business's posts go out as. Only shown once a Page exists:
+          // with just the profile there is nothing to choose.
+          state.identities.length > 1 ? el('label', { class: 'row small', style: 'gap:6px', title:
+            'Posts for this business go out as this identity, and only into groups it has joined. ' +
+            'Already-queued posts follow the change.' },
+          el('span', { class: 'dim' }, 'Posts as'),
+          select(identityOf(b)?.id, state.identities.map((i) => [i.id, i.kind === 'page' ? `${i.name} (Page)` : i.name]),
+            async (v) => {
+              const chosen = state.identities.find((i) => i.id === Number(v));
+              try {
+                await patch(`/api/businesses/${b.id}`, { identityId: chosen?.kind === 'page' ? chosen.id : null });
+                await refreshCore(); await render();
+                flash(`${b.name} now posts as ${chosen?.name}.`, 'ok');
+              } catch (err) { showError(err); }
+            }, { style: 'width:auto;min-width:160px' })) : null,
           btn('', async () => {
             const name = await promptDialog('Rename business', 'Business name', b.name);
             if (!name || name === b.name) return;
@@ -989,7 +1232,7 @@ function adBlock(ad) {
               v.listingPriceCents != null ? el('span', { class: 'dim' }, ` · ${(v.listingPriceCents / 100).toFixed(2)}`) : null) : null,
             el('div', { class: 'clamp2' }, v.caption),
             v.imagePaths.length ? el('div', { class: 'thumbs mt2' },
-              v.imagePaths.map((p) => el('img', { class: 'thumb', src: mediaUrl(p), alt: '', loading: 'lazy' }))) : null),
+              v.imagePaths.map((p) => el('img', { class: 'thumb', src: mediaUrl(p), alt: '', loading: 'lazy', onclick: (e) => { e.stopPropagation(); openLightbox(mediaUrl(p)); } }))) : null),
           v.weight > 1 ? el('span', { class: 'tag', title: 'Picked more often' }, `×${v.weight}`) : null,
           btn('', () => variantDialog(ad, v), { kind: 'ghost', size: 'sm', icon: 'edit', title: 'Edit variant' }),
           toggle(v.active, async (on) => {
@@ -1082,6 +1325,7 @@ const REASONS = {
   'daily-cap': { t: 'Eligible, but out of slots', d: 'The window ran out of daily-cap slots before reaching these groups.', fix: ['Review the cap', 'settings'] },
   'outside-active-hours': { t: 'Outside active hours', d: 'No slot inside your active hours.', fix: ['Review active hours', 'settings'] },
   'no-assignment': { t: 'No business assigned', d: 'A group only receives ads from businesses assigned to it.', fix: ['Assign in Groups', 'groups'] },
+  'not-a-member': { t: 'Not a member as this identity', d: 'The business posts as a Page (or profile) that has not joined these groups. Join them as that identity on Facebook, then import its groups again.', fix: ['Import groups', 'setup'] },
   'rounds-today': { t: 'Round allowance used up today', d: 'These groups already had their rounds for today.' },
   'round-too-soon': { t: 'Resting between rounds', d: 'Still inside the rest period since their last round.' },
   'round-daily-cap': { t: 'Round daily ceiling reached', d: 'The overall limit on round posts per day is used up.', fix: ['Review round limits', 'settings'] },
@@ -1624,8 +1868,8 @@ function storageSection() {
 const roundPick = { businessId: null, adId: null, plan: null, planKey: '' };
 
 async function viewRounds() {
-  const job = await get('/api/jobs/current').catch(() => null);
-  if (job) startPolling();
+  const jobs = await fetchRunningJobs();
+  if (jobs.length) startPolling();
   await hydrateAssignments();
 
   const s = state.settings;
@@ -1641,7 +1885,11 @@ async function viewRounds() {
   if (roundPick.planKey !== key) { roundPick.plan = null; roundPick.planKey = key; }
 
   const assignedIds = state.assignments.get(roundPick.businessId) ?? new Set();
-  const assignedActive = state.groups.filter((g) => g.active && assignedIds.has(g.id)).length;
+  // Counted only where the business's identity is a member — a Page business
+  // with twenty assigned groups it never joined has nowhere to post.
+  const roundIdentity = identityOf(state.businesses.find((b) => b.id === roundPick.businessId) ?? {});
+  const assignedActive = state.groups.filter((g) => g.active && assignedIds.has(g.id)
+    && !memberProblem(g.id, roundIdentity)).length;
 
   // --- clear-quarantine checkbox ---------------------------------------------
   const qCount = c.groupsQuarantined ?? 0;
@@ -1675,7 +1923,11 @@ async function viewRounds() {
   };
 
   const plan = roundPick.plan;
-  const canStart = !s.breakerTripped && !!chosenAd && !!plan && plan.posts.length > 0 && !job;
+  // Busy only if a run as THIS business's identity is going. A round as
+  // another identity runs beside it in its own Chrome window.
+  const busyHere = laneBusy(jobs, roundIdentity?.id);
+  const runningElsewhere = jobs.filter((j) => j.lane !== `identity-${roundIdentity?.id}`);
+  const canStart = !s.breakerTripped && !!chosenAd && !!plan && plan.posts.length > 0 && !busyHere;
 
   const startRound = async () => {
     const auto = s.defaultRunnerMode === 'auto';
@@ -1760,7 +2012,15 @@ async function viewRounds() {
           el('p', { class: 'hint tight' },
             assignedActive
               ? `${plural(assignedActive, 'active group')} assigned to ${nameOf(roundPick.businessId, state.businesses)}.`
-              : el('span', { style: 'color:var(--warn)' }, `No active groups are assigned to ${nameOf(roundPick.businessId, state.businesses)} yet.`)),
+              : el('span', { style: 'color:var(--warn)' }, `No active groups are assigned to ${nameOf(roundPick.businessId, state.businesses)} yet.`),
+            roundIdentity && state.identities.length > 1 ? ` Posts as ${roundIdentity.name}.` : null),
+          busyHere
+            ? callout('info', `A run as ${roundIdentity.name} is already going.`,
+              'Each identity runs one thing at a time. Stop it below, or pick a business that posts as a different identity to run a round beside it.')
+            : runningElsewhere.length
+              ? callout('info', `${runningElsewhere.map(jobTitle).join(', ')} is going.`,
+                `This round runs beside it, in ${roundIdentity?.name ?? 'this identity'}'s own Chrome window. Groups already in that round are left out of this one.`)
+              : null,
           el('div', { class: 'row gap3 mt4' },
             btn(plan ? 'Refresh dry run' : 'Dry run — show me the round', dryRun,
               { kind: plan ? 'secondary' : '', icon: 'eye', disabled: !chosenAd }),
@@ -1771,9 +2031,9 @@ async function viewRounds() {
             el('span', { class: 'dim small' }, !plan ? 'Unlocks after a dry run.' : `Runner mode: ${s.defaultRunnerMode}.`)))),
 
     card('Preview', { sub: 'A dry run posts nothing' }, previewBody),
-    activityCard(job),
+    activityCard(jobs),
   );
-  if (job) pollJob();
+  if (jobs.length) pollJob();
 }
 
 // ---------------------------------------------------------------- routing ---
@@ -1848,9 +2108,9 @@ try {
   await refreshCore();
   await show(VIEWS[location.hash.slice(1)] ? location.hash.slice(1) : 'dashboard');
   // A job may already be running from a previous page load.
-  const job = await get('/api/jobs/current').catch(() => null);
-  setFootJob(job);
-  if (job) startPolling();
+  const jobs = await fetchRunningJobs();
+  setFootJob(jobs);
+  if (jobs.length) startPolling();
 } catch (err) {
   mount(callout('bad', 'Could not reach the server.', err.message));
 }

@@ -5,18 +5,48 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Locator } from 'playwright';
-import { typeHumanely, isCommentTextboxName, decideStatusOpener } from './composers.ts';
+import { typeHumanely, isCommentTextboxName, decideStatusOpener, typedTextMismatch } from './composers.ts';
 
-/** Just enough of a Locator to record what typeHumanely presses. */
-function recordingLocator(): { locator: Locator; keys: string[] } {
+test('typed text that Facebook left alone passes, whatever its emoji and spacing', () => {
+  const caption = '📍 Serving the West Coast\n\n📲 WhatsApp/Call: 073 859 5637';
+  assert.equal(typedTextMismatch(caption, 'Serving the West Coast\nWhatsApp/Call: 073 859 5637'), null);
+});
+
+test('a word turned into a tag of a page is caught', () => {
+  const caption = '📍 Serving the West Coast\n\n📲 WhatsApp/Call: 073 859 5637';
+  const posted = 'Serving the West Coast To Coast Waterproofing📲 WhatsApp/Call: 073 859 5637';
+  assert.match(typedTextMismatch(caption, posted) ?? '', /found "to coast waterproofing whatsapp"/);
+});
+
+test('missing trailing words are caught', () => {
+  assert.notEqual(typedTextMismatch('book today', 'book'), null);
+});
+
+/**
+ * Just enough of a Locator to record what typeHumanely presses. `handlesLineBreak`
+ * models whether the editor acts on the line-break input event (Facebook's
+ * does); a handled one is recorded as '<br>'. When false, every page check
+ * (line break, open suggestion list) comes back negative.
+ */
+function recordingLocator(handlesLineBreak = false): { locator: Locator; keys: string[] } {
   const keys: string[] = [];
   const fake = {
     click: async () => {},
     press: async (key: string) => { keys.push(key); },
     type: async (text: string) => { keys.push(text); },
+    evaluate: async () => {
+      if (handlesLineBreak) keys.push('<br>');
+      return handlesLineBreak;
+    },
   };
   return { locator: fake as unknown as Locator, keys };
 }
+
+test('typeHumanely breaks lines without pressing a key when the editor allows it', async () => {
+  const { locator, keys } = recordingLocator(true);
+  await typeHumanely(locator, 'Call\n\nb');
+  assert.deepEqual(keys, ['C', 'a', 'l', 'l', '<br>', '<br>', 'b']);
+});
 
 test('typeHumanely puts newlines between lines only, never after the last', async () => {
   const { locator, keys } = recordingLocator();

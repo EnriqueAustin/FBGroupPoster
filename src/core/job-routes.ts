@@ -13,6 +13,8 @@ import type { JobRunner } from './jobs.ts';
 export function registerJobRoutes(app: FastifyInstance, jobs: JobRunner): void {
   app.get('/api/jobs', () => jobs.list().map((j) => ({ ...j, lines: j.lines.slice(-5) })));
   app.get('/api/jobs/current', () => jobs.current());
+  /** Every job still going — one per lane at most. */
+  app.get('/api/jobs/running', () => jobs.running());
   app.get('/api/jobs/:id', (req) => {
     const id = String((req.params as { id: string }).id);
     return must(jobs.get(id), 'job');

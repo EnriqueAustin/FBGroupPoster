@@ -88,6 +88,55 @@ const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 4,
+    name: 'identities',
+    up(db) {
+      // Posting as a Facebook Page as well as the personal profile.
+      //
+      // Groups stay one row per Facebook group, but membership becomes
+      // per-identity: a Page has to join each group itself. Every existing
+      // group is backfilled as a membership of the profile, and every existing
+      // business keeps identity_id NULL (= the profile), so the upgrade itself
+      // changes nothing about what gets posted where.
+      //
+      // The ALTERed REFERENCES columns must default to NULL — SQLite refuses a
+      // non-NULL default on an added foreign-key column.
+      db.exec(`
+        CREATE TABLE identities (
+          id          INTEGER PRIMARY KEY AUTOINCREMENT,
+          name        TEXT    NOT NULL,
+          kind        TEXT    NOT NULL CHECK (kind IN ('profile', 'page')),
+          page_url    TEXT,
+          fb_page_id  TEXT,
+          created_at  TEXT    NOT NULL
+        );
+        CREATE UNIQUE INDEX idx_identities_one_profile ON identities (kind) WHERE kind = 'profile';
+
+        CREATE TABLE group_memberships (
+          group_id          INTEGER NOT NULL REFERENCES groups (id)     ON DELETE CASCADE,
+          identity_id       INTEGER NOT NULL REFERENCES identities (id) ON DELETE CASCADE,
+          active            INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+          last_seen_at      TEXT,
+          quarantined_until TEXT,
+          quarantine_reason TEXT,
+          PRIMARY KEY (group_id, identity_id)
+        );
+        CREATE INDEX idx_group_memberships_identity ON group_memberships (identity_id, active);
+
+        ALTER TABLE businesses ADD COLUMN identity_id INTEGER REFERENCES identities (id) ON DELETE SET NULL;
+        ALTER TABLE post_log   ADD COLUMN identity_id INTEGER REFERENCES identities (id) ON DELETE SET NULL;
+      `);
+      const now = new Date().toISOString();
+      const profileId = Number(db.prepare(
+        "INSERT INTO identities (name, kind, created_at) VALUES ('Personal profile', 'profile', ?)",
+      ).run(now).lastInsertRowid);
+      db.prepare(`INSERT INTO group_memberships (group_id, identity_id, active, last_seen_at)
+        SELECT id, ?, 1, NULL FROM groups`).run(profileId);
+      // History before this point was all posted as the profile.
+      db.prepare('UPDATE post_log SET identity_id = ?').run(profileId);
+    },
+  },
 ];
 
 // Facebook's history lives in the original `schema_version` table: renaming it
@@ -101,7 +150,11 @@ export function currentVersion(db: Database): number {
   return coreCurrentVersion(db, VERSION_TABLE);
 }
 
-/** Applies every pending migration. Returns the versions actually applied. */
-export function migrate(db: Database): number[] {
-  return runMigrations(db, VERSION_TABLE, MIGRATIONS);
+/**
+ * Applies every pending migration. Returns the versions actually applied.
+ * `upTo` stops early — only tests use it, to build a database as an older
+ * install had it and then check the upgrade.
+ */
+export function migrate(db: Database, upTo: number = LATEST_SCHEMA_VERSION): number[] {
+  return runMigrations(db, VERSION_TABLE, MIGRATIONS, upTo);
 }

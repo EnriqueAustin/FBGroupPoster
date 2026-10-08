@@ -35,7 +35,9 @@ const store = openStore(DB_PATH);
 const scheduler = createScheduler(store);
 // Same database file, own tables (ig_*) and own migration history.
 const igStore = openIgStore(DB_PATH);
-// One runner for every module: only one job may drive the browser at a time.
+// One runner for every module, lanes within it: one job per Chrome profile,
+// so a Facebook round as a Page, one as the profile, and Instagram work can
+// all be going at once.
 const jobs = createJobRunner();
 
 const app = Fastify({ logger: false });

@@ -8,10 +8,11 @@
  */
 import Database from 'better-sqlite3';
 import type {
-  NewAd, NewAdVariant, NewBusiness, NewGroup, NewPostLog, NewQueueItem, Store,
+  GroupCreateOptions, NewAd, NewAdVariant, NewBusiness, NewGroup, NewIdentity, NewPostLog,
+  NewQueueItem, Store,
 } from '../domain/contracts.ts';
 import type {
-  Ad, AdVariant, Business, ComposerType, Group, GroupAssignment,
+  Ad, AdVariant, Business, ComposerType, Group, GroupAssignment, GroupMembership, Identity,
   IsoDateTime, PostLog, QueueItem, QueueStatus, Settings,
 } from '../domain/types.ts';
 import { DEFAULT_SETTINGS } from '../domain/types.ts';
@@ -35,7 +36,26 @@ const toBusiness = (r: Row): Business => ({
   name: String(r.name),
   active: bool(r.active),
   dailyCapShare: numOrNull(r.daily_cap_share),
+  identityId: numOrNull(r.identity_id),
   createdAt: String(r.created_at),
+});
+
+const toIdentity = (r: Row): Identity => ({
+  id: num(r.id),
+  name: String(r.name),
+  kind: String(r.kind) as Identity['kind'],
+  pageUrl: nul<string>(r.page_url),
+  fbPageId: nul<string>(r.fb_page_id),
+  createdAt: String(r.created_at),
+});
+
+const toMembership = (r: Row): GroupMembership => ({
+  groupId: num(r.group_id),
+  identityId: num(r.identity_id),
+  active: bool(r.active),
+  lastSeenAt: nul<string>(r.last_seen_at),
+  quarantinedUntil: nul<string>(r.quarantined_until),
+  quarantineReason: nul<string>(r.quarantine_reason),
 });
 
 const toGroup = (r: Row): Group => ({
@@ -106,6 +126,7 @@ const toPostLog = (r: Row): PostLog => ({
   error: nul<string>(r.error),
   detail: nul<string>(r.detail),
   roundId: nul<string>(r.round_id),
+  identityId: numOrNull(r.identity_id),
 });
 
 const toSettings = (r: Row): Settings => ({
@@ -166,7 +187,9 @@ export function openStore(dbPath: string): Store {
   const one = (sql: string) => db.prepare(sql);
 
   // --- businesses ------------------------------------------------------------
-  const businessCols = { name: 'name', active: 'active', dailyCapShare: 'daily_cap_share' };
+  const businessCols = {
+    name: 'name', active: 'active', dailyCapShare: 'daily_cap_share', identityId: 'identity_id',
+  };
 
   const businesses: Store['businesses'] = {
     list(opts) {
@@ -181,8 +204,8 @@ export function openStore(dbPath: string): Store {
     },
     create(x: NewBusiness) {
       const info = one(
-        'INSERT INTO businesses (name, active, daily_cap_share, created_at) VALUES (?, ?, ?, ?)',
-      ).run(x.name, b(x.active), x.dailyCapShare, now());
+        'INSERT INTO businesses (name, active, daily_cap_share, identity_id, created_at) VALUES (?, ?, ?, ?, ?)',
+      ).run(x.name, b(x.active), x.dailyCapShare, x.identityId ?? null, now());
       return businesses.get(Number(info.lastInsertRowid))!;
     },
     update(id, patch) {
@@ -191,6 +214,109 @@ export function openStore(dbPath: string): Store {
       const found = businesses.get(id);
       if (!found) throw new Error(`business ${id} not found`);
       return found;
+    },
+  };
+
+  // --- identities ------------------------------------------------------------
+  const identityCols = { name: 'name', pageUrl: 'page_url', fbPageId: 'fb_page_id' };
+
+  const identities: Store['identities'] = {
+    list() {
+      // Profile first, then Pages by name: the order every picker wants.
+      return (one("SELECT * FROM identities ORDER BY kind = 'page', name").all() as Row[]).map(toIdentity);
+    },
+    get(id) {
+      const r = one('SELECT * FROM identities WHERE id = ?').get(id) as Row | undefined;
+      return r ? toIdentity(r) : null;
+    },
+    profile() {
+      const r = one("SELECT * FROM identities WHERE kind = 'profile'").get() as Row | undefined;
+      // Seeded by migration 4 and protected by remove(); missing means a
+      // hand-edited database, and guessing would post as the wrong person.
+      if (!r) throw new Error('the personal profile identity is missing from the database');
+      return toIdentity(r);
+    },
+    forBusiness(biz) {
+      if (biz.identityId === null) return identities.profile();
+      // ON DELETE SET NULL normally makes a dangling id impossible; fall back
+      // to the profile rather than throwing mid-plan if it ever happens.
+      return identities.get(biz.identityId) ?? identities.profile();
+    },
+    createPage(x: NewIdentity) {
+      const info = one(`INSERT INTO identities (name, kind, page_url, fb_page_id, created_at)
+        VALUES (?, 'page', ?, NULL, ?)`).run(x.name, x.pageUrl, now());
+      return identities.get(Number(info.lastInsertRowid))!;
+    },
+    update(id, patch) {
+      const { clause, vals } = buildSet(patch, identityCols);
+      if (clause) one(`UPDATE identities SET ${clause} WHERE id = ?`).run(...vals, id);
+      const found = identities.get(id);
+      if (!found) throw new Error(`identity ${id} not found`);
+      return found;
+    },
+    remove(id) {
+      const found = identities.get(id);
+      if (!found) throw new Error(`identity ${id} not found`);
+      if (found.kind === 'profile') throw new Error('the personal profile cannot be removed');
+      one('DELETE FROM identities WHERE id = ?').run(id);
+    },
+  };
+
+  // --- memberships -----------------------------------------------------------
+  const membershipCols = {
+    active: 'active', lastSeenAt: 'last_seen_at',
+    quarantinedUntil: 'quarantined_until', quarantineReason: 'quarantine_reason',
+  };
+
+  const memberships: Store['memberships'] = {
+    list(opts) {
+      const where: string[] = [];
+      const params: unknown[] = [];
+      if (opts?.identityId !== undefined) { where.push('identity_id = ?'); params.push(opts.identityId); }
+      if (opts?.groupId !== undefined) { where.push('group_id = ?'); params.push(opts.groupId); }
+      const sql = `SELECT * FROM group_memberships${where.length ? ` WHERE ${where.join(' AND ')}` : ''}
+        ORDER BY group_id, identity_id`;
+      return (db.prepare(sql).all(...params) as Row[]).map(toMembership);
+    },
+    get(groupId, identityId) {
+      const r = one('SELECT * FROM group_memberships WHERE group_id = ? AND identity_id = ?')
+        .get(groupId, identityId) as Row | undefined;
+      return r ? toMembership(r) : null;
+    },
+    set(groupId, identityId, patch) {
+      one('INSERT OR IGNORE INTO group_memberships (group_id, identity_id, active) VALUES (?, ?, 1)')
+        .run(groupId, identityId);
+      const { clause, vals } = buildSet(patch, membershipCols, { active: b });
+      if (clause) {
+        one(`UPDATE group_memberships SET ${clause} WHERE group_id = ? AND identity_id = ?`)
+          .run(...vals, groupId, identityId);
+      }
+      return memberships.get(groupId, identityId)!;
+    },
+    sync(identityId, seenGroupIds, at) {
+      const seen = new Set(seenGroupIds);
+      const before = new Set(memberships.list({ identityId }).filter((m) => m.active).map((m) => m.groupId));
+      const upsert = one(`INSERT INTO group_memberships (group_id, identity_id, active, last_seen_at)
+        VALUES (?, ?, 1, ?)
+        ON CONFLICT (group_id, identity_id) DO UPDATE SET active = 1, last_seen_at = excluded.last_seen_at`);
+      const drop = one('UPDATE group_memberships SET active = 0 WHERE group_id = ? AND identity_id = ?');
+      let added = 0;
+      let deactivated = 0;
+      db.transaction(() => {
+        for (const gid of seen) {
+          upsert.run(gid, identityId, at);
+          if (!before.has(gid)) added++;
+        }
+        for (const gid of before) {
+          if (!seen.has(gid)) { drop.run(gid, identityId); deactivated++; }
+        }
+      })();
+      return { added, deactivated };
+    },
+    clearQuarantines() {
+      // Only live ones, so the count matches what the UI showed as quarantined.
+      return one(`UPDATE group_memberships SET quarantined_until = NULL, quarantine_reason = NULL
+        WHERE quarantined_until > ?`).run(now()).changes;
     },
   };
 
@@ -213,6 +339,10 @@ export function openStore(dbPath: string): Store {
         sql += ' JOIN group_assignments ga ON ga.group_id = g.id AND ga.business_id = ?';
         params.push(opts.businessId);
       }
+      if (opts?.identityId !== undefined) {
+        sql += ' JOIN group_memberships gm ON gm.group_id = g.id AND gm.identity_id = ? AND gm.active = 1';
+        params.push(opts.identityId);
+      }
       if (opts?.activeOnly) where.push('g.active = 1');
       if (opts?.composerType) { where.push('g.composer_type = ?'); params.push(opts.composerType); }
       if (where.length) sql += ` WHERE ${where.join(' AND ')}`;
@@ -227,20 +357,30 @@ export function openStore(dbPath: string): Store {
       const r = one('SELECT * FROM groups WHERE fb_group_id = ?').get(fbGroupId) as Row | undefined;
       return r ? toGroup(r) : null;
     },
-    create(x: NewGroup) {
-      const info = one(`INSERT INTO groups
-        (fb_group_id, name, url, member_count, composer_type, active, cooldown_days_override,
-         rules_notes, quarantined_until, quarantine_reason, tags, name_locked, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        x.fbGroupId, x.name, x.url, x.memberCount, x.composerType, b(x.active),
-        x.cooldownDaysOverride, x.rulesNotes, x.quarantinedUntil, x.quarantineReason,
-        j(x.tags), b(x.nameLocked ?? false), now(),
-      );
-      return groups.get(Number(info.lastInsertRowid))!;
+    create(x: NewGroup, opts?: GroupCreateOptions) {
+      const memberOf = opts?.memberOf ?? [identities.profile().id];
+      const addMember = one(`INSERT OR IGNORE INTO group_memberships (group_id, identity_id, active)
+        VALUES (?, ?, 1)`);
+      let id = 0;
+      // One transaction so a group can never exist without the membership
+      // that says who may post to it.
+      db.transaction(() => {
+        const info = one(`INSERT INTO groups
+          (fb_group_id, name, url, member_count, composer_type, active, cooldown_days_override,
+           rules_notes, quarantined_until, quarantine_reason, tags, name_locked, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          x.fbGroupId, x.name, x.url, x.memberCount, x.composerType, b(x.active),
+          x.cooldownDaysOverride, x.rulesNotes, x.quarantinedUntil, x.quarantineReason,
+          j(x.tags), b(x.nameLocked ?? false), now(),
+        );
+        id = Number(info.lastInsertRowid);
+        for (const identityId of memberOf) addMember.run(id, identityId);
+      })();
+      return groups.get(id)!;
     },
-    upsertByFbId(x: NewGroup) {
+    upsertByFbId(x: NewGroup, opts?: GroupCreateOptions) {
       const existing = groups.getByFbId(x.fbGroupId);
-      if (!existing) return { group: groups.create(x), created: true };
+      if (!existing) return { group: groups.create(x, opts), created: true };
       // Pinning nameLocked explicitly stops update() from auto-locking: the
       // importer's name is a scrape, not a human edit. Without this the first
       // re-import would lock every group and freeze all names forever.
@@ -368,12 +508,15 @@ export function openStore(dbPath: string): Store {
       const r = one('SELECT * FROM queue_items WHERE id = ?').get(id) as Row | undefined;
       return r ? toQueueItem(r) : null;
     },
-    nextDue(nowIso: IsoDateTime) {
+    nextDue(nowIso: IsoDateTime, opts = {}) {
+      const ids = opts.businessIds;
+      if (ids && ids.length === 0) return null;
       // 'running' is included so a run interrupted mid-post resumes that item
       // rather than stranding it forever in a non-terminal state.
-      const r = one(`SELECT * FROM queue_items
+      const r = db.prepare(`SELECT * FROM queue_items
         WHERE status IN ('pending', 'due', 'running') AND scheduled_for <= ?
-        ORDER BY scheduled_for LIMIT 1`).get(nowIso) as Row | undefined;
+        ${ids ? `AND business_id IN (${ids.map(() => '?').join(', ')})` : ''}
+        ORDER BY scheduled_for LIMIT 1`).get(nowIso, ...(ids ?? [])) as Row | undefined;
       return r ? toQueueItem(r) : null;
     },
     createMany(items: NewQueueItem[]) {
@@ -416,13 +559,16 @@ export function openStore(dbPath: string): Store {
       return one("UPDATE queue_items SET runner_mode = ? WHERE status IN ('pending', 'due')")
         .run(mode).changes;
     },
-    clearRounds() {
+    clearRounds(opts = {}) {
+      const ids = opts.businessIds;
+      if (ids && ids.length === 0) return 0;
       // 'cancelled' is swept alongside the unposted ones: a cancelled row from
       // a previous round is a dead plan with no value, and leaving it behind is
       // what made the queue look full of duplicates — the same group appearing
       // once cancelled and once pending, round after round.
-      return one(`DELETE FROM queue_items
-        WHERE status IN ('pending', 'due', 'cancelled') AND round_id IS NOT NULL`).run().changes;
+      return db.prepare(`DELETE FROM queue_items
+        WHERE status IN ('pending', 'due', 'cancelled') AND round_id IS NOT NULL
+        ${ids ? `AND business_id IN (${ids.map(() => '?').join(', ')})` : ''}`).run(...(ids ?? [])).changes;
     },
     remove(ids) {
       if (ids.length === 0) return 0;
@@ -441,10 +587,11 @@ export function openStore(dbPath: string): Store {
     append(x: NewPostLog) {
       const info = one(`INSERT INTO post_log
         (queue_item_id, group_id, business_id, ad_id, variant_id, outcome, posted_at,
-         fb_post_url, error, detail, round_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+         fb_post_url, error, detail, round_id, identity_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         x.queueItemId, x.groupId, x.businessId, x.adId, x.variantId,
         x.outcome, x.postedAt, x.fbPostUrl, x.error, x.detail, x.roundId ?? null,
+        x.identityId ?? null,
       );
       return toPostLog(one('SELECT * FROM post_log WHERE id = ?').get(Number(info.lastInsertRowid)) as Row);
     },
@@ -560,5 +707,7 @@ export function openStore(dbPath: string): Store {
     },
   };
 
-  return { businesses, groups, ads, queue, log, settings, close: () => db.close() };
+  return {
+    businesses, identities, memberships, groups, ads, queue, log, settings, close: () => db.close(),
+  };
 }

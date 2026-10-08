@@ -42,6 +42,27 @@ export interface RunnerBrowser {
 
 export const DEFAULT_PROFILE_DIRNAME = '.browser-profile';
 
+/**
+ * The Chrome profile an identity works in.
+ *
+ * One per identity, because "acting as a Page" is a cookie on the whole
+ * Facebook session: two runs sharing a profile would keep switching each other
+ * between the profile and the Page mid-post. With a profile each, a Page's
+ * window stays switched into that Page and a round as the Page can run beside
+ * a round as the profile. The personal profile keeps the original directory so
+ * its existing sign-in carries on; each Page's profile is signed into once.
+ *
+ * Typed structurally rather than against Facebook's `Identity`: core knows
+ * about browser profiles, not about who a module is posting as.
+ */
+export function profileDirFor(
+  identity: { id: number | string; kind: string } | null | undefined,
+  projectRoot = process.cwd(),
+): string {
+  return !identity || identity.kind === 'profile'
+    ? path.join(projectRoot, DEFAULT_PROFILE_DIRNAME)
+    : path.join(projectRoot, `${DEFAULT_PROFILE_DIRNAME}-page-${identity.id}`);
+}
 
 function defaultLog(msg: string): void {
   // eslint-disable-next-line no-console

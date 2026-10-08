@@ -6,24 +6,41 @@
  * just an INSERT loop.
  */
 import type { GroupDiscoverer, Store } from './domain/contracts.ts';
+import type { Id } from './domain/types.ts';
 import { cleanGroupName } from './runner/discover-groups.ts';
 
 export interface ImportResult {
   found: number;
   created: number;
   updated: number;
+  /** Groups this identity is newly recorded as a member of. */
+  joined: number;
+  /** Memberships of this identity that the import no longer found. */
+  left: number;
 }
 
+/**
+ * `identityId` is who the discoverer was acting as — the import is the truth
+ * about THAT identity's memberships only. Omitted = the personal profile.
+ *
+ * Groups themselves are shared: a group both you and your Page are in stays
+ * one row, with its curation, and simply gains a second membership.
+ */
 export async function importGroups(
   store: Store,
   discoverer: GroupDiscoverer,
   log: (msg: string) => void = () => {},
+  identityId?: Id,
 ): Promise<ImportResult> {
+  const identity = identityId === undefined ? store.identities.profile() : store.identities.get(identityId);
+  if (!identity) throw new Error(`identity ${identityId} not found`);
+
   const found = await discoverer.discover();
-  log(`Found ${found.length} group(s).`);
+  log(`Found ${found.length} group(s) for ${identity.name}.`);
 
   let created = 0;
   let updated = 0;
+  const seen: Id[] = [];
 
   for (const g of found) {
     const existing = store.groups.getByFbId(g.fbGroupId);
@@ -63,13 +80,26 @@ export async function importGroups(
       // Stated rather than left to upsertByFbId's default so the intent is
       // visible here: an import never locks a name, and never unlocks one.
       nameLocked: existing?.nameLocked ?? false,
-    });
+      // A new group gets no membership here — not even the profile's default.
+      // memberships.sync below records it for whoever found it, and nobody
+      // else: a group only your Page is in must not become postable by the
+      // profile. (Both happen before anything can plan against the group.)
+    }, { memberOf: [] });
     if (res.created) created++; else updated++;
+    seen.push(res.group.id);
   }
 
+  const { added: joined, deactivated: left } =
+    store.memberships.sync(identity.id, seen, new Date().toISOString());
+
   log(`${created} new, ${updated} updated.`);
+  if (joined > 0) log(`${identity.name} is now recorded in ${joined} more group(s).`);
+  if (left > 0) {
+    log(`${identity.name} was not found in ${left} group(s) it was in before — `
+      + 'it will not post there until a later import finds it again.');
+  }
   if (created > 0) {
     log('New groups are INACTIVE. Switch on the ones you want in the Groups tab.');
   }
-  return { found: found.length, created, updated };
+  return { found: found.length, created, updated, joined, left };
 }

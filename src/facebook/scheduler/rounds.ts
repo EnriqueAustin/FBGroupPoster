@@ -22,6 +22,7 @@
  */
 import type { Plan, PlanExclusion, PlannedPost, Store } from '../domain/contracts.ts';
 import type { AdVariant, Id, QueueItem } from '../domain/types.ts';
+import { membershipBlock } from './membership.ts';
 import { mulberry32, weightedPick } from '../../core/rng.ts';
 import { dayBoundsUtcMs, localHour, MS_PER_MINUTE, toIso } from '../../core/time.ts';
 
@@ -42,20 +43,23 @@ export interface RoundPlan extends Plan {
   warning: string | null;
 }
 
-/** Readable in the queue, and unique per minute. */
-function makeRoundId(nowMs: number): string {
+/**
+ * Readable in the queue, and unique per business per minute — two identities'
+ * rounds started in the same minute must not share an id, or each would count
+ * the other's posts as its own.
+ */
+function makeRoundId(nowMs: number, businessId: Id): string {
   const iso = new Date(nowMs).toISOString();
-  return `round-${iso.slice(0, 10)}-${iso.slice(11, 13)}${iso.slice(14, 16)}`;
+  return `round-${iso.slice(0, 10)}-${iso.slice(11, 13)}${iso.slice(14, 16)}-b${businessId}`;
 }
 
 export function planRound(store: Store, opts: RoundOptions): RoundPlan {
   const s = store.settings.get();
   const nowMs = Date.parse(opts.now);
   const rng = mulberry32(opts.seed ?? Math.floor(nowMs / MS_PER_MINUTE));
-  const roundId = makeRoundId(nowMs);
-
   const business = store.businesses.get(opts.businessId);
   if (!business) throw new Error(`business ${opts.businessId} not found`);
+  const roundId = makeRoundId(nowMs, business.id);
 
   // --- pick the ad -----------------------------------------------------------
   const ads = store.ads
@@ -76,7 +80,21 @@ export function planRound(store: Store, opts: RoundOptions): RoundPlan {
   const dayFrom = toIso(dayStart);
   const dayTo = toIso(dayEnd);
 
-  const roundPostsToday = store.log.countRoundPostsBetween(dayFrom, dayTo);
+  const identity = store.identities.forBusiness(business);
+
+  // A round another identity is running right now. Its posts are not in the
+  // history yet, but they will be — so they count towards the daily ceiling,
+  // and a group it is about to post to is not posted to by this round as well.
+  // This identity's own queued round items are left out: starting this round
+  // replaces them (clearRounds), so counting them would count them twice.
+  const otherRounds = store.queue.list({ status: ['pending', 'due', 'running'] }).filter((q) => {
+    if (q.roundId === null) return false;
+    const b = store.businesses.get(q.businessId);
+    return !!b && store.identities.forBusiness(b).id !== identity.id;
+  });
+  const queuedElsewhere = new Set(otherRounds.map((q) => q.groupId));
+
+  const roundPostsToday = store.log.countRoundPostsBetween(dayFrom, dayTo) + otherRounds.length;
   const capLeft = s.roundDailyCap === null
     ? Number.POSITIVE_INFINITY
     : Math.max(0, s.roundDailyCap - roundPostsToday);
@@ -96,8 +114,15 @@ export function planRound(store: Store, opts: RoundOptions): RoundPlan {
       add('group-quarantined', group.quarantineReason ?? undefined);
       continue;
     }
+    const notMember = membershipBlock(store, groupId, identity, nowMs);
+    if (notMember) { add(notMember.reason, notMember.detail); continue; }
     if (group.composerType !== ad.composerType) {
       add('no-eligible-ad', `this group needs a ${group.composerType} ad; "${ad.name}" is ${ad.composerType}`);
+      continue;
+    }
+
+    if (queuedElsewhere.has(groupId)) {
+      add('round-too-soon', 'already in a round another identity is running — it rests after that one');
       continue;
     }
 

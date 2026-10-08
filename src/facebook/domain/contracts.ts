@@ -5,7 +5,7 @@
  */
 import type {
   Ad, AdVariant, BlockKind, Business, ComposerType, Group, GroupAssignment,
-  Id, IsoDateTime, PostLog, PostOutcome, QueueItem, QueueStatus,
+  GroupMembership, Id, Identity, IsoDateTime, PostLog, PostOutcome, QueueItem, QueueStatus,
   RunnerMode, Settings,
 } from './types.ts';
 
@@ -17,11 +17,23 @@ import type {
 // which starts unlocked, and on update the store derives the lock itself
 // (see groups.update) — so callers only mention it to unlock deliberately.
 export type NewGroup = Omit<Group, 'id' | 'createdAt' | 'nameLocked'> & { nameLocked?: boolean };
-export type NewBusiness = Omit<Business, 'id' | 'createdAt'>;
+// identityId is optional on input: null (the personal profile) is the default
+// and what every business was before identities existed.
+export type NewBusiness = Omit<Business, 'id' | 'createdAt' | 'identityId'> & { identityId?: Id | null };
 export type NewAd = Omit<Ad, 'id' | 'createdAt'>;
 export type NewAdVariant = Omit<AdVariant, 'id' | 'createdAt'>;
 export type NewQueueItem = Omit<QueueItem, 'id' | 'createdAt' | 'attempts' | 'lastError'>;
-export type NewPostLog = Omit<PostLog, 'id'>;
+export type NewPostLog = Omit<PostLog, 'id' | 'identityId'> & { identityId?: Id | null };
+export type NewIdentity = Pick<Identity, 'name' | 'pageUrl'>;
+
+/**
+ * Who a new group row is a member as. Omitted = the personal profile: the
+ * registry held only the profile's groups before identities existed, and
+ * every caller that does not know about identities still means that.
+ */
+export interface GroupCreateOptions {
+  memberOf?: Id[];
+}
 
 export interface Store {
   businesses: {
@@ -31,17 +43,55 @@ export interface Store {
     update(id: Id, patch: Partial<NewBusiness>): Business;
   };
 
+  identities: {
+    list(): Identity[];
+    get(id: Id): Identity | null;
+    /** The personal profile. Always exists (seeded by migration). */
+    profile(): Identity;
+    /** Who a business posts as: its identity, or the profile when unset. */
+    forBusiness(business: Pick<Business, 'identityId'>): Identity;
+    /** Pages only — the profile is seeded, never created. */
+    createPage(i: NewIdentity): Identity;
+    update(id: Id, patch: Partial<Pick<Identity, 'name' | 'pageUrl' | 'fbPageId'>>): Identity;
+    /**
+     * Remove a Page. Its memberships go with it; businesses posting as it fall
+     * back to the profile; history keeps its rows (identity_id is nulled).
+     * Refuses the profile.
+     */
+    remove(id: Id): void;
+  };
+
+  memberships: {
+    list(opts?: { identityId?: Id; groupId?: Id }): GroupMembership[];
+    get(groupId: Id, identityId: Id): GroupMembership | null;
+    /** Upsert one membership. A new row starts active. */
+    set(groupId: Id, identityId: Id,
+      patch: Partial<Omit<GroupMembership, 'groupId' | 'identityId'>>): GroupMembership;
+    /**
+     * Make an import's findings the truth for one identity: every group in
+     * `seenGroupIds` becomes an active membership stamped `at`, and every other
+     * membership of that identity is deactivated. Quarantines are untouched —
+     * still being in a group says nothing about whether it accepts our posts.
+     */
+    sync(identityId: Id, seenGroupIds: Id[], at: IsoDateTime): { added: number; deactivated: number };
+    /** Lift every membership quarantine still in force. Returns how many. */
+    clearQuarantines(): number;
+  };
+
   groups: {
-    list(opts?: { activeOnly?: boolean; businessId?: Id; composerType?: ComposerType }): Group[];
+    /** identityId = only groups where that identity has an active membership. */
+    list(opts?: { activeOnly?: boolean; businessId?: Id; composerType?: ComposerType; identityId?: Id }): Group[];
     get(id: Id): Group | null;
     getByFbId(fbGroupId: string): Group | null;
-    create(g: NewGroup): Group;
+    create(g: NewGroup, opts?: GroupCreateOptions): Group;
     /**
      * Insert or update by fbGroupId. Used by the bootstrap importer, so unlike
      * update() it does NOT lock the name it writes: a scraped name is not a
      * human edit. The existing lock is kept unless `nameLocked` is given.
+     * `opts.memberOf` applies only when the row is created; on update the
+     * caller manages memberships itself (see memberships.sync).
      */
-    upsertByFbId(g: NewGroup): { group: Group; created: boolean };
+    upsertByFbId(g: NewGroup, opts?: GroupCreateOptions): { group: Group; created: boolean };
     /**
      * Partial update. A patch that carries `name` also sets nameLocked = true
      * (every caller of this is a human edit via the Groups tab), unless the
@@ -67,8 +117,12 @@ export interface Store {
   queue: {
     list(opts?: { status?: QueueStatus | QueueStatus[]; from?: IsoDateTime; to?: IsoDateTime }): QueueItem[];
     get(id: Id): QueueItem | null;
-    /** Earliest item that is due and not yet terminal. */
-    nextDue(now: IsoDateTime): QueueItem | null;
+    /**
+     * Earliest item that is due and not yet terminal. `businessIds` limits it
+     * to those businesses — how a run sticks to its own identity's posts while
+     * another identity's run works through theirs.
+     */
+    nextDue(now: IsoDateTime, opts?: { businessIds?: Id[] }): QueueItem | null;
     createMany(items: NewQueueItem[]): QueueItem[];
     update(id: Id, patch: Partial<Pick<QueueItem, 'status' | 'attempts' | 'lastError' | 'scheduledFor' | 'runnerMode'>>): QueueItem;
     /** Drop everything still 'pending' — used when replanning. */
@@ -79,8 +133,12 @@ export interface Store {
      * one, or the change appears to do nothing.
      */
     setModeForWaiting(mode: RunnerMode): number;
-    /** Drop unposted round items, so a new round replaces a stale one. */
-    clearRounds(): number;
+    /**
+     * Drop unposted round items, so a new round replaces a stale one.
+     * `businessIds` limits it to those businesses, so starting a round for one
+     * identity does not delete a round another identity is running.
+     */
+    clearRounds(opts?: { businessIds?: Id[] }): number;
     /**
      * Permanently delete queue rows. Unlike cancelling, nothing is left behind.
      * Safe for history: post_log rows point at queue items with ON DELETE SET
@@ -161,6 +219,9 @@ export interface PlanExclusion {
     | 'daily-cap'
     | 'outside-active-hours'
     | 'no-assignment'
+    // the business posts as an identity (usually a Page) that has not joined
+    // this group, or whose membership an import no longer finds
+    | 'not-a-member'
     // round-only reasons; the day-scale cooldowns do not apply inside a round
     | 'rounds-today'
     | 'round-too-soon'
@@ -197,10 +258,23 @@ export interface PostJob {
   ad: Ad;
   variant: AdVariant;
   mode: RunnerMode;
+  /**
+   * Who to post as. The runner switches the browser into this identity before
+   * opening the group, and refuses to compose if it cannot confirm the switch.
+   * The orchestrator always sets it; absent means "do not switch", which only
+   * test doubles rely on.
+   */
+  identity?: Identity;
 }
 
 export interface PostResult {
   outcome: PostOutcome;
+  /**
+   * The Page id the runner observed while acting as job.identity, when that
+   * identity had none stored yet. The orchestrator saves it so every later
+   * switch can be verified against it.
+   */
+  learnedFbPageId?: string;
   fbPostUrl?: string;
   error?: string;
   detail?: string;

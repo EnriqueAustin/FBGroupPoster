@@ -7,7 +7,8 @@
  * lives in src/runner. This file only sequences them and records what happened.
  */
 import type { PostResult, Runner, Store } from './domain/contracts.ts';
-import type { Id, PostOutcome, QueueItem } from './domain/types.ts';
+import type { Id, Identity, PostOutcome, QueueItem } from './domain/types.ts';
+import { membershipBlock } from './scheduler/membership.ts';
 // Pure policy function with no browser dependency (detect.ts only imports
 // Playwright's types). Imported rather than restated so "which blocks stop the
 // run" has exactly one definition.
@@ -55,6 +56,14 @@ export interface OrchestratorOptions {
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
   log?: (msg: string) => void;
+  /**
+   * Only work through posts that go out as this identity. Omitted = every
+   * due post, whoever it is for. Set it whenever another identity's run may
+   * be going at the same time.
+   */
+  identityId?: Id;
+  /** Polled alongside stop(), so a caller can end the run without a handle on it. */
+  isStopRequested?: () => boolean;
 }
 
 export interface RunSummary {
@@ -109,6 +118,22 @@ export function createOrchestrator(opts: OrchestratorOptions) {
   const log = opts.log ?? ((m: string) => console.log(m));
 
   let stopRequested = false;
+  const stopping = () => stopRequested || (opts.isStopRequested?.() ?? false);
+
+  /**
+   * Which queue items this run may take. With an identity set, only those of
+   * businesses posting as it — the rest belong to that identity's own run, in
+   * its own browser. Read live each time, so it follows a business being
+   * switched to a different identity mid-run.
+   */
+  function scope(): { businessIds?: Id[] } {
+    if (opts.identityId === undefined) return {};
+    return {
+      businessIds: store.businesses.list()
+        .filter((b) => store.identities.forBusiness(b).id === opts.identityId)
+        .map((b) => b.id),
+    };
+  }
 
   /**
    * Sleep, but notice a Stop.
@@ -120,7 +145,7 @@ export function createOrchestrator(opts: OrchestratorOptions) {
   async function restUntilOrStop(totalMs: number): Promise<void> {
     const SLICE = 5_000;
     let left = totalMs;
-    while (left > 0 && !stopRequested) {
+    while (left > 0 && !stopping()) {
       const chunk = Math.min(SLICE, left);
       await sleep(chunk);
       left -= chunk;
@@ -159,9 +184,37 @@ export function createOrchestrator(opts: OrchestratorOptions) {
     const group = store.groups.get(item.groupId);
     const ad = store.ads.get(item.adId);
     const variant = store.ads.getVariant(item.variantId);
-    if (!group || !ad || !variant) return null;
+    const business = store.businesses.get(item.businessId);
+    if (!group || !ad || !variant || !business) return null;
     const mode = store.settings.get().defaultRunnerMode;
-    return { queueItemId: item.id, group, ad, variant, mode };
+    // Like the mode, the identity is read live from the business: switching a
+    // business to its Page should apply to what is already queued.
+    const identity = store.identities.forBusiness(business);
+    return { queueItemId: item.id, group, ad, variant, mode, identity };
+  }
+
+  /**
+   * Quarantine one identity's membership rather than the group. Used when a
+   * group refuses a PAGE — most often because it does not allow Pages — which
+   * says nothing about whether your profile may post there.
+   */
+  function quarantineMembership(groupId: Id, groupName: string, identity: Identity, days: number, reason: string): void {
+    const until = new Date(now().getTime() + days * DAY_MS).toISOString();
+    store.memberships.set(groupId, identity.id, { quarantinedUntil: until, quarantineReason: reason });
+
+    const waiting = store.queue.list({ status: ['pending', 'due'] }).filter((q) => {
+      if (q.groupId !== groupId) return false;
+      const biz = store.businesses.get(q.businessId);
+      return !!biz && store.identities.forBusiness(biz).id === identity.id;
+    });
+    for (const q of waiting) {
+      store.queue.update(q.id, { status: 'cancelled', lastError: `${identity.name} quarantined in this group: ${reason}` });
+    }
+
+    log(`    QUARANTINED ${groupName} for ${identity.name} only, ${days} days `
+      + `(until ${new Date(until).toLocaleDateString()}): ${reason}`);
+    if (waiting.length) log(`    cancelled ${waiting.length} other queued post(s) as ${identity.name} for this group`);
+    log('    Other identities can still post there. Clear it early in the Groups tab if this is wrong.');
   }
 
   function isQuarantined(groupId: Id): boolean {
@@ -193,7 +246,10 @@ export function createOrchestrator(opts: OrchestratorOptions) {
     log('    It will not be planned again until then. Clear it early in the Groups tab if this is wrong.');
   }
 
-  function record(item: QueueItem, outcome: PostOutcome, extra: { fbPostUrl?: string; error?: string; detail?: string }): void {
+  function record(
+    item: QueueItem, outcome: PostOutcome, identityId: Id | null,
+    extra: { fbPostUrl?: string; error?: string; detail?: string },
+  ): void {
     store.log.append({
       queueItemId: item.id,
       groupId: item.groupId,
@@ -208,6 +264,7 @@ export function createOrchestrator(opts: OrchestratorOptions) {
       // Carried through so the round guards (roundsPerDay, minHoursBetweenRounds)
       // can count what a group actually received rather than what was planned.
       roundId: item.roundId,
+      identityId,
     });
   }
 
@@ -240,12 +297,23 @@ export function createOrchestrator(opts: OrchestratorOptions) {
 
     await runner.start();
     try {
-      while (!stopRequested && summary.attempted < maxPosts) {
-        const item = store.queue.nextDue(now().toISOString());
+      while (!stopping() && summary.attempted < maxPosts) {
+        // Checked every time round, not just at the start: a run as another
+        // identity, on the same Facebook account, may have tripped it while
+        // this one was waiting between posts.
+        const live = store.settings.get();
+        if (live.breakerTripped) {
+          log(`Circuit breaker was tripped (${live.breakerReason ?? 'no reason recorded'}). Stopping.`);
+          summary.stoppedBecause = 'breaker';
+          return summary;
+        }
+
+        const item = store.queue.nextDue(now().toISOString(), scope());
         if (!item) {
           const nowIso = now().toISOString();
+          const mine = scope().businessIds;
           const upcoming = store.queue.list({ status: ['pending', 'due'] })
-            .filter((q) => q.scheduledFor > nowIso)
+            .filter((q) => q.scheduledFor > nowIso && (!mine || mine.includes(q.businessId)))
             .sort((a, b) => a.scheduledFor.localeCompare(b.scheduledFor))[0];
 
           // Nothing due *yet* is not the same as nothing to do. Within the
@@ -289,13 +357,24 @@ export function createOrchestrator(opts: OrchestratorOptions) {
 
         const job = hydrate(item);
         if (!job) {
-          store.queue.update(item.id, { status: 'cancelled', lastError: 'referenced group/ad/variant no longer exists' });
+          store.queue.update(item.id, { status: 'cancelled', lastError: 'referenced group/ad/variant/business no longer exists' });
+          continue;
+        }
+
+        // Planned for an identity that is not (or no longer) in this group —
+        // the business was switched to a Page after planning, or an import
+        // found the Page gone. Posting would only fail on Facebook's side.
+        const notMember = membershipBlock(store, job.group.id, job.identity, now().getTime());
+        if (notMember) {
+          store.queue.update(item.id, { status: 'cancelled', lastError: notMember.detail });
+          log(`    skipped ${job.group.name}: ${notMember.detail}`);
           continue;
         }
 
         summary.attempted++;
         store.queue.update(item.id, { status: 'running', attempts: item.attempts + 1 });
         log(`[${summary.attempted}/${maxPosts}] ${job.group.name} — ${job.ad.name}`
+          + `${job.identity.kind === 'page' ? `  [as ${job.identity.name}]` : ''}`
           + `${job.mode === 'auto' ? '  [AUTO — it will click Post itself]' : '  [assisted — you click Post]'}`
           + `${item.roundId ? `  [${item.roundId}]` : ''}`);
         if (job.group.rulesNotes.trim()) log(`    group rules: ${job.group.rulesNotes.trim()}`);
@@ -304,16 +383,24 @@ export function createOrchestrator(opts: OrchestratorOptions) {
         // happened (e.g. 'posted' for a post awaiting approval) and cooldowns,
         // which read the history, see it too.
         const result = resolveResult(await runner.post(job));
+        if (result.learnedFbPageId && job.identity.fbPageId === null) {
+          // First switch into this Page: keep its id so every later switch is
+          // verified against it, not just "acting as some Page".
+          store.identities.update(job.identity.id, { fbPageId: result.learnedFbPageId });
+        }
         if (result.outcome === 'failed' && result.blockKind) {
           log(`    ${job.group.name} refused the post (${result.blockKind}) — moving on; the breaker is NOT tripped`);
         }
         // Record first, so the history row exists before the group vanishes
         // from planning — the history is where a human goes to find out why.
-        record(item, result.outcome, result);
+        record(item, result.outcome, job.identity.id, result);
 
         // Both cases below are about this group only: neither trips the
         // breaker, and both would fail the same way on every retry.
-        if (result.outcome === 'failed' && result.blockKind === 'group-restricted') {
+        if (result.outcome === 'failed' && result.blockKind === 'group-restricted' && job.identity.kind === 'page') {
+          quarantineMembership(job.group.id, job.group.name, job.identity, GROUP_RESTRICTED_QUARANTINE_DAYS,
+            `Facebook refused posts from ${job.identity.name} in this group: ${result.error ?? 'group-restricted'}`);
+        } else if (result.outcome === 'failed' && result.blockKind === 'group-restricted') {
           quarantineGroup(job.group.id, job.group.name, GROUP_RESTRICTED_QUARANTINE_DAYS,
             `Facebook refused posts in this group: ${result.error ?? 'group-restricted'}`);
         } else if (isWrongComposerFailure(result)) {
@@ -351,7 +438,7 @@ export function createOrchestrator(opts: OrchestratorOptions) {
         // scheduler exists to prevent. When the next item is still in the
         // future, its own scheduled time already provides the gap and the wait
         // at the top of the loop serves it; pausing here too would double it.
-        const following = store.queue.nextDue(now().toISOString());
+        const following = store.queue.nextDue(now().toISOString(), scope());
         if (following) {
           const s = store.settings.get();
           // A round is paced by its own, much shorter gaps — that is the whole
@@ -365,7 +452,7 @@ export function createOrchestrator(opts: OrchestratorOptions) {
           await restUntilOrStop(waitMs);
         }
       }
-      if (stopRequested) summary.stoppedBecause = 'stopped';
+      if (stopping()) summary.stoppedBecause = 'stopped';
       else if (summary.attempted >= maxPosts) summary.stoppedBecause = 'limit-reached';
     } finally {
       await runner.stop();

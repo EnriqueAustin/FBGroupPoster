@@ -6,11 +6,12 @@
  * needs Playwright.
  */
 import type { DiscoveredGroup, GroupDiscoverer } from '../domain/contracts.ts';
-import type { ComposerType } from '../domain/types.ts';
+import type { ComposerType, Identity } from '../domain/types.ts';
 import path from 'node:path';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { firstPage, launchBrowser } from '../../core/browser.ts';
+import { firstPage, launchBrowser, profileDirFor } from '../../core/browser.ts';
 import { FACEBOOK_GROUPS_JOINED, FACEBOOK_HOME, isLoggedIn, login } from './auth.ts';
+import { ensureIdentity } from './identity.ts';
 
 export interface DiscoverOptions {
   projectRoot?: string;
@@ -30,6 +31,16 @@ export interface DiscoverOptions {
    * while waiting. Resolving to false cancels the import.
    */
   confirmSignIn?: () => Promise<boolean>;
+  /**
+   * Read the groups THIS identity has joined. Omitted = whoever the browser
+   * is currently acting as, which is the personal profile unless something
+   * switched it. Pass the profile explicitly to be sure.
+   */
+  identity?: Identity;
+  /** Asked when the switch into `identity` cannot be done automatically. */
+  askSwitch?: (identity: Identity) => Promise<boolean>;
+  /** Called with a Page's id the first time we see it, so it can be stored. */
+  onLearnedFbPageId?: (fbPageId: string) => void;
 }
 
 /** Words that suggest a group expects marketplace-style listings. */
@@ -172,7 +183,9 @@ export function createGroupDiscoverer(opts: DiscoverOptions = {}): GroupDiscover
 
   return {
     async discover(): Promise<DiscoveredGroup[]> {
-      const browser = await launchBrowser({ projectRoot: opts.projectRoot, log });
+      // The identity's own profile, so the Page profile a later round posts
+      // from is the one that was signed in and switched here.
+      const browser = await launchBrowser({ profileDir: profileDirFor(opts.identity, opts.projectRoot), log });
       try {
         const page = await firstPage(browser.context);
         await page.goto(FACEBOOK_HOME, { waitUntil: 'domcontentloaded', timeout: 60_000 });
@@ -192,6 +205,18 @@ export function createGroupDiscoverer(opts: DiscoverOptions = {}): GroupDiscover
             ...(opts.loginTimeoutMs === undefined ? {} : { timeoutMs: opts.loginTimeoutMs }),
           });
           if (!signedIn) throw new Error('timed out waiting for sign-in');
+        }
+
+        // The joined-groups list shows whoever the session is acting as, so
+        // become the right identity first. Importing a Page's groups as the
+        // profile (or the reverse) would record memberships that are not real.
+        if (opts.identity) {
+          const sw = await ensureIdentity(browser.context, page, opts.identity, {
+            log, ...(opts.askSwitch ? { askHuman: opts.askSwitch } : {}),
+          });
+          if (!sw.ok) throw new Error(`${sw.error} — import cancelled, nothing was changed`);
+          if (sw.learnedFbPageId) opts.onLearnedFbPageId?.(sw.learnedFbPageId);
+          log(`[discover] reading the groups ${opts.identity.name} has joined.`);
         }
 
         // Retry the navigation a few times: a just-completed 2FA often lands on
@@ -289,9 +314,15 @@ export function createGroupDiscoverer(opts: DiscoverOptions = {}): GroupDiscover
             log(`[discover] first text: ${diag.text.slice(0, 200).replace(/\n/g, ' | ')}`);
           }
 
-          throw new Error(
-            `Found no groups. Saved a screenshot and a page dump in ${dir} (discover-empty-${stamp}.*). `
-            + 'Send those over and the scraping can be fixed against what your account actually shows.',
+          // Thrown rather than returned even for a Page: an empty result would
+          // mark every membership the Page had as gone, and a broken scrape
+          // must never be able to do that.
+          throw new Error(opts.identity?.kind === 'page'
+            ? `Found no groups for ${opts.identity.name}. If the Page has not joined any groups yet, `
+              + 'switch to it on Facebook, request to join some, and import again once an admin approves. '
+              + `A screenshot and page dump are in ${dir} (discover-empty-${stamp}.*).`
+            : `Found no groups. Saved a screenshot and a page dump in ${dir} (discover-empty-${stamp}.*). `
+              + 'Send those over and the scraping can be fixed against what your account actually shows.',
           );
         }
 
