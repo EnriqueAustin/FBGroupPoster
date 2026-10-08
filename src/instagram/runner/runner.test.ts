@@ -15,6 +15,7 @@ import {
 } from './parse.ts';
 import { decideLoggedIn } from './auth.ts';
 import { isTerminal, matchIgBlock, selectBlockText } from './detect.ts';
+import { classifyReply, matchThreadToLeads } from './check.ts';
 import { profileFilter } from '../planner/filters.ts';
 import { DEFAULT_FILTERS } from '../domain/types.ts';
 
@@ -216,4 +217,46 @@ test('only Instagram’s own text can trip the breaker, never a caption', () => 
     bodyText: 'Help us confirm it is you',
   });
   assert.equal(matchIgBlock('https://www.instagram.com/', fullPage).kind, 'challenge');
+});
+
+test('a reply that says "not interested" in any of its wordings is an opt-out', () => {
+  for (const text of [
+    'Not interested thanks',
+    'no thanks',
+    'Please stop messaging me',
+    "don't message me again",
+    'unsubscribe',
+    'how did you get my details?',
+    'this is spam',
+  ]) {
+    assert.equal(classifyReply(text), 'opt-out', text);
+  }
+
+  for (const text of ['Yes please!', 'How much is it?', 'Sure, send me the details', '']) {
+    assert.equal(classifyReply(text), 'reply', text);
+  }
+});
+
+test('an inbox thread matches a lead only when it is unambiguous', () => {
+  const candidates = [
+    { id: 1, username: 'thandi.m', displayName: 'Thandi M' },
+    { id: 2, username: 'sipho_k', displayName: 'Sipho K' },
+    { id: 3, username: 'other_one', displayName: 'Thandi M' },
+  ];
+
+  // A handle in the row wins outright.
+  assert.equal(
+    matchThreadToLeads({ title: 'sipho_k', username: 'sipho_k' }, candidates)?.id,
+    2,
+  );
+  // Usually there is only a display name.
+  assert.equal(
+    matchThreadToLeads({ title: 'Sipho K', username: null }, candidates)?.id,
+    2,
+  );
+  // Two waiting leads share a display name: match nothing, leave it to the
+  // human. Stopping the wrong sequence is worse than stopping none.
+  assert.equal(matchThreadToLeads({ title: 'Thandi M', username: null }, candidates), null);
+  assert.equal(matchThreadToLeads({ title: 'Nobody At All', username: null }, candidates), null);
+  assert.equal(matchThreadToLeads({ title: '', username: null }, candidates), null);
 });

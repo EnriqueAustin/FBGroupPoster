@@ -5,7 +5,7 @@
  * cap, or vice versa.
  */
 import type { IgStore } from '../domain/contracts.ts';
-import type { Id, IgActionOutcome, IgLead, IsoDateTime } from '../domain/types.ts';
+import type { Id, IgActionKind, IgActionOutcome, IgLead, IsoDateTime } from '../domain/types.ts';
 import { mulberry32, type Rng } from '../../core/rng.ts';
 import { toIso } from '../../core/time.ts';
 import { dmDueAfterFollow, dmDueAfterFollowBack } from './planner.ts';
@@ -114,7 +114,7 @@ export function markFailed(
  * human has looked. The lead itself is not penalised — it was not its fault.
  */
 export function markBlocked(
-  store: IgStore, leadId: Id | null, kind: 'follow' | 'dm' | 'profile_visit' | 'check',
+  store: IgStore, leadId: Id | null, kind: IgActionKind,
   reason: string, at: IsoDateTime,
 ): void {
   const lead = leadId === null ? null : mustLead(store, leadId);

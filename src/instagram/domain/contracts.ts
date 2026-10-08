@@ -3,7 +3,7 @@
  * about SQLite; the runner will know nothing about the planner.
  */
 import type {
-  Id, IgAction, IgActionKind, IgCampaign, IgLead, IgMessageVariant, IgSettings,
+  Id, IgAction, IgActionKind, IgCampaign, IgFilters, IgLead, IgMessageVariant, IgSettings,
   IsoDateTime, LeadSource, LeadStatus,
 } from './types.ts';
 
@@ -79,4 +79,96 @@ export interface IgStore {
   };
 
   close(): void;
+}
+
+// ---------------------------------------------------------------------------
+// The runner
+// ---------------------------------------------------------------------------
+
+/**
+ * What one attempted action amounts to, in domain terms.
+ *
+ * Deliberately flattened: the run loop needs to know whether a follow stuck
+ * and whether they already follow us (which pulls the DM forward), and
+ * nothing else about the profile. Everything the browser layer read on the
+ * way to that answer stays in the browser layer.
+ *
+ * `blocked` is separate from `failed` because the two mean opposite things
+ * for the breaker: a failure is this lead's problem, a block is the
+ * account's.
+ */
+export type IgFollowResult =
+  | { outcome: 'followed'; followsUs: boolean }
+  | { outcome: 'already-following'; followsUs: boolean }
+  | { outcome: 'skipped'; reason: string }
+  | { outcome: 'failed'; error: string }
+  | { outcome: 'blocked'; reason: string };
+
+export type IgDmResult =
+  /** Confirmed in the thread (auto), or the human said they sent it. */
+  | { outcome: 'sent' }
+  | { outcome: 'skipped'; reason: string }
+  | { outcome: 'failed'; error: string }
+  | { outcome: 'blocked'; reason: string };
+
+/** What the harvester needs from the database without being given all of it. */
+export interface IgHarvestContext {
+  /** Already a lead, in any campaign or status. */
+  isKnown: (username: string) => boolean;
+}
+
+export interface IgHarvestResult {
+  /** People found and pre-filtered, ready for store.leads.addHarvested. */
+  people: HarvestedLead[];
+  /** Pre-filtered-out counts by reason, for the run log. */
+  skipped: Record<string, number>;
+  /** Posts actually read. */
+  postsRead: number;
+  /** Anything the human should know: no posts, likes hidden, and so on. */
+  notes: string[];
+  /** Set when Instagram pushed back; the caller trips the breaker. */
+  blocked?: string;
+}
+
+export type IgFollowersResult =
+  | { outcome: 'ok'; followers: Set<string> }
+  | { outcome: 'failed'; error: string }
+  | { outcome: 'blocked'; reason: string };
+
+/** One inbox row, matched to a lead where that could be done unambiguously. */
+export interface IgInboxEntry {
+  leadId: Id | null;
+  title: string;
+  preview: string;
+  unread: boolean;
+  /** 'opt-out' means never contact again; see runner/check.ts. */
+  kind: 'opt-out' | 'reply';
+}
+
+export type IgInboxResult =
+  | { outcome: 'ok'; entries: IgInboxEntry[] }
+  | { outcome: 'failed'; error: string }
+  | { outcome: 'blocked'; reason: string };
+
+/**
+ * The browser, behind an interface.
+ *
+ * The run loop is written against this and tested with a fake, which is what
+ * keeps the loop's rules — caps, gaps, the breaker, how a failure differs
+ * from a block — testable without Instagram. The Playwright implementation is
+ * in runner/playwright-ig-runner.ts.
+ */
+export interface IgRunner {
+  /**
+   * Open the browser and make sure the session is signed in. False means the
+   * human never finished signing in, and nothing should be attempted.
+   */
+  start(): Promise<boolean>;
+  follow(username: string, filters: IgFilters): Promise<IgFollowResult>;
+  /** `text` is already rendered; the runner does not know what a variant is. */
+  dm(username: string, text: string): Promise<IgDmResult>;
+  harvest(campaign: IgCampaign, sourceHandle: string, ctx: IgHarvestContext): Promise<IgHarvestResult>;
+  followers(): Promise<IgFollowersResult>;
+  inbox(candidates: readonly { id: Id; username: string; displayName: string | null }[]): Promise<IgInboxResult>;
+  stop(): Promise<void>;
 }
