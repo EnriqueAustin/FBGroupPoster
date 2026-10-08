@@ -7,6 +7,7 @@ data/*.db-shm
 data/media/
 .browser-profile/
 .browser-profile-page-*/
+.browser-profile-instagram/
 .env
 *.log
 data/backups/
