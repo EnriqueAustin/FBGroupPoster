@@ -1,7 +1,9 @@
 # Instagram campaign DMs — plan
 
-Status: **steps 1–2 built** — domain, store, planner and lead lifecycle,
-all tested, no browser yet. Next: step 3 (sign-in + collect-only harvest).
+Status: **all six steps built.** Domain, store, planner, lifecycle, runner,
+jobs and UI, with 90-odd tests. What is NOT done is the one thing tests cannot
+do: **no selector here has been run against live Instagram.** That is the next
+job — see "Before the first real run" below.
 
 Same spirit as the Facebook module: assisted first, slow on purpose, stop the
 moment the platform pushes back.
@@ -103,15 +105,48 @@ gaps, breaker).
 
 ## Build order
 
-1. **Domain + store + migrations**, with tests. Pure, no browser.
-2. **Planner** — given leads, caps and the action log, decide what is due and
-   when (reuses `core/rng.ts`, `core/time.ts`). Tests.
-3. **Sign-in + harvest, collect-only.** First live test: does it find the
-   likers you'd expect? Nothing is followed or sent.
-4. **Follow + DM in assisted mode.** You approve each one.
-5. **UI** for campaigns, leads, safety.
-6. **Auto mode + reply tracking** (check inbox, mark `replied`, stop the
-   sequence for that lead).
+1. ~~Domain + store + migrations~~ — `domain/`, `store/`.
+2. ~~Planner~~ — `planner/planner.ts`, `lifecycle.ts`, `filters.ts`,
+   `messages.ts`.
+3. ~~Sign-in + harvest, collect-only~~ — `runner/auth.ts`, `detect.ts`,
+   `parse.ts`, `selectors.ts`, `harvest.ts`.
+4. ~~Follow + DM in assisted mode~~ — `runner/follow.ts`, `dm.ts`, with
+   `orchestrator.ts` as the run loop and `playwright-ig-runner.ts` behind the
+   `IgRunner` contract.
+5. ~~UI for campaigns, leads, safety~~ — `routes.ts`, three screens in
+   `src/web/`.
+6. ~~Auto mode + reply tracking~~ — `runner/check.ts`, `checkIg`.
+
+## Before the first real run
+
+The selectors in `runner/selectors.ts` are written from how Instagram's pages
+are built, not from a session against them. Until they have been checked,
+treat every one as a guess.
+
+1. **Collect leads**, on a campaign pointed at one source you do not mind
+   experimenting on. It follows nobody and sends nothing, so the worst outcome
+   is an empty list. Watch the job console: "no posts found" means the post
+   grid selector is wrong; posts read but no leads means the likes list is.
+2. Check that the leads it collected are people you would expect. Fix
+   `selectors.ts`, repeat.
+3. **One assisted run with the follow cap at 2 or 3.** You approve each
+   follow, so a wrong profile is caught by you and not by Instagram.
+4. Leave it a day, run **Check replies**, confirm follow-backs are noticed.
+5. Only then raise the caps, a few at a time.
+
+## Known gaps
+
+- **A variant's image is not sent.** The column, the store and the media
+  cleanup's protection of the file are all in place, but the DM composer does
+  not attach it. A run warns when a chosen variant has one, rather than
+  sending the text alone in silence.
+- **Message requests are not read.** A cold DM to a stranger lands in their
+  requests folder; `check.ts` reads the main inbox only. A lead who accepts
+  the request moves into it, so their reply is still noticed — one who replies
+  without accepting is not.
+- **The inbox shows display names, not handles**, so a thread is matched to a
+  lead by name. Two waiting leads sharing a display name match nothing and are
+  reported for a human to look at (`matchThreadToLeads`).
 
 ## Decisions
 

@@ -141,13 +141,14 @@ business posting as the profile, so nothing changes until you pick a Page.
 
 ## Shape
 
-The app is a shell with one module per platform. Facebook is the first; an
-Instagram module is being added (see `src/instagram/PLAN.md`).
+The app is a shell with one module per platform: Facebook groups, and
+Instagram campaign DMs (`src/instagram/PLAN.md` — built, but its selectors
+have not yet been run against the live site).
 
 ```
 core/              shared, platform-agnostic
   browser.ts       persistent Chrome profile + wait-for-the-human sign-in loop
-  jobs.ts          background jobs (one browser job at a time, app-wide)
+  jobs.ts          background jobs, one per lane (a lane is a Chrome profile)
   job-routes.ts    poll / answer / stop a job
   migrations.ts    per-module migration runner (one version table per module)
   http.ts rng.ts time.ts config.ts
@@ -159,7 +160,13 @@ facebook/          the group poster
   orchestrator.ts  The run loop + circuit breaker.
   routes.ts        Fastify API.
   cli/             Terminal entry points.
-instagram/         campaign DMs: domain, store, planner (runner + UI in progress)
+instagram/         campaign DMs (own tables, own breaker, own Chrome profile)
+  domain/          types + interfaces, including the IgRunner contract.
+  store/           SQLite behind IgStore. Tables are ig_*, version ig_schema_version.
+  planner/         What is due and when; lead lifecycle; filters; message rendering.
+  runner/          Playwright: auth, harvest (collect-only), follow, dm, check.
+  orchestrator.ts  Three loops: harvestIg, checkIg, runIg.
+  routes.ts        Fastify API under /api/ig.
 server/main.ts     Wires core + modules together; 127.0.0.1 only.
 cli/backup.ts      Snapshot of the whole database.
 web/               Local UI, no build step.
@@ -171,8 +178,35 @@ scheduler. Modules never import each other — anything two modules need lives
 in `core/`.
 
 All modules share **one database file** (each owns its own tables and its own
-version table), **one Chrome profile** (sign in to each site once) and **one job
-runner** (so FB and IG can never drive the browser at the same time).
+version table) and **one job runner**. They do not share a Chrome profile: each
+Facebook identity has one and Instagram has its own, and a job runs in its
+profile's lane, so Instagram work and a Facebook round can be going at once
+while two jobs in one lane cannot.
+
+What is deliberately **not** shared between Facebook and Instagram: the
+circuit breaker (a Facebook block says nothing about the Instagram account, and
+the reverse), the daily caps, and the sign-in. The one thing that crosses is
+media cleanup, which is told about Instagram's variant images so it never
+deletes a file the other module is using.
+
+## Instagram campaign DMs
+
+A campaign points at local business accounts, collects the people who engage
+with their posts, follows them, and messages them once a day or two later —
+or sooner if they follow back. `src/instagram/PLAN.md` has the reasoning, the
+data model, what will get the account blocked, and the order to try things in.
+
+Two rules are worth repeating here, because they are what the module is for:
+
+- **A username is a lead once, ever.** `ig_leads` is also the contacted
+  registry, keyed on the username across every campaign, so nobody is
+  approached twice. This is why a campaign with leads can be deactivated but
+  never deleted.
+- **Nothing is recorded as done unless it was confirmed.** A follow counts
+  only once the button is seen to stay on "Following"; a DM counts only once
+  the message is in the thread (or the human says they sent it). An
+  unconfirmed action is a failure, because recording a follow that never
+  happened would schedule a cold DM to someone who never saw it.
 
 ## The safety rules, and why each exists
 
