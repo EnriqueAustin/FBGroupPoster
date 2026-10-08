@@ -41,7 +41,9 @@ test('every nav button in the HTML has a matching view in app.js', () => {
   assert.ok(viewsBlock, 'could not find the VIEWS map in app.js');
 
   for (const name of navViews) {
-    assert.match(viewsBlock[1]!, new RegExp(`\\b${name}\\s*:`),
+    // A hyphenated view name ('ig-leads') can only be written as a quoted key,
+    // so the quotes are optional here.
+    assert.match(viewsBlock[1]!, new RegExp(`['"]?\\b${name}\\b['"]?\\s*:`),
       `nav button "${name}" has no entry in VIEWS — clicking it would throw`);
   }
 });

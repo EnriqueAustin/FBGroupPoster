@@ -104,7 +104,7 @@ export async function runIg(deps: IgRunDeps, opts: { maxSteps?: number } = {}): 
       break;
     }
 
-    const current = currentPlan(store, now());
+    const current = planNow(store, now());
     for (const warning of current.warnings) {
       if (!summary.warnings.includes(warning)) {
         summary.warnings.push(warning);
@@ -164,7 +164,14 @@ export async function runIg(deps: IgRunDeps, opts: { maxSteps?: number } = {}): 
 
 type StepOutcome = 'done' | 'blocked' | 'stop';
 
-function currentPlan(store: IgStore, now: Date) {
+/**
+ * The plan as it stands right now.
+ *
+ * Exported because the UI's dry run must show exactly what a run would do —
+ * same function, same inputs, and the planner is seeded, so the plan you
+ * inspect is the plan that runs.
+ */
+export function planNow(store: IgStore, now: Date) {
   const campaigns = store.campaigns.list({ activeOnly: true });
   const day = dayWindow(now);
   return plan({

@@ -26,6 +26,10 @@
         <button data-view="rounds"><span class="ic" data-icon="repeat"></span> Rounds</button>
         <button data-view="queue"><span class="ic" data-icon="list"></span> Queue &amp; Log <span class="count" id="c-queue"></span></button>
         <button data-view="settings"><span class="ic" data-icon="shield"></span> Safety</button>
+        <span class="label">Instagram</span>
+        <button data-view="ig-campaigns"><span class="ic" data-icon="megaphone"></span> Campaigns</button>
+        <button data-view="ig-leads"><span class="ic" data-icon="users"></span> Leads <span class="count" id="c-ig-leads"></span></button>
+        <button data-view="ig-safety"><span class="ic" data-icon="shield"></span> IG Safety</button>
       </nav>
       <div class="foot">
         <div class="line" id="foot-job"><span class="dot"></span><span>Idle</span></div>
@@ -43,6 +47,14 @@
             <p id="breaker-reason"></p>
           </div>
           <div class="acts"><button class="btn danger" id="clear-breaker">Clear it</button></div>
+        </div>
+        <div id="ig-breaker" hidden class="banner bad">
+          <span class="ic" data-icon="alert"></span>
+          <div class="txt">
+            <strong>Instagram pushed back — nothing Instagram will run.</strong>
+            <p id="ig-breaker-reason"></p>
+          </div>
+          <div class="acts"><button class="btn danger" id="clear-ig-breaker">Clear it</button></div>
         </div>
         <div id="view"></div>
       </div>

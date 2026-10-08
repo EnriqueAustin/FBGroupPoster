@@ -21,6 +21,7 @@ import { openStore } from '../facebook/store/sqlite-store.ts';
 import { createScheduler } from '../facebook/scheduler/planner.ts';
 import { registerRoutes as registerFacebookRoutes, MEDIA_DIR } from '../facebook/routes.ts';
 import { openIgStore } from '../instagram/store/sqlite-store.ts';
+import { registerIgRoutes } from '../instagram/routes.ts';
 
 const HOST = '127.0.0.1';
 // Overridable so a second instance can run alongside the real one — pair it
@@ -58,6 +59,7 @@ registerFacebookRoutes(app, store, scheduler, {
   otherReferencedImages: () => igStore.variants.list()
     .map((v) => v.imagePath).filter((p): p is string => p !== null),
 });
+registerIgRoutes(app, igStore, { jobs });
 
 const shutdown = async () => {
   await app.close();

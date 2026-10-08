@@ -295,12 +295,15 @@ const state = {
   // Who posts can go out as (the profile first, then Pages), and who is a
   // member of which group: groupId -> Map(identityId -> membership).
   identities: [], memberships: new Map(),
+  // The Instagram module keeps its own everything: tables, settings, breaker.
+  ig: { settings: null, campaigns: [] },
 };
 
 async function refreshCore() {
-  const [businesses, groups, ads, summary, identities, memberships] = await Promise.all([
+  const [businesses, groups, ads, summary, identities, memberships, igSettings, igCounts] = await Promise.all([
     get('/api/businesses'), get('/api/groups'), get('/api/ads'), get('/api/summary'),
     get('/api/identities'), get('/api/memberships'),
+    get('/api/ig/settings'), get('/api/ig/leads/counts'),
   ]);
   const byGroup = new Map();
   for (const m of memberships) {
@@ -329,6 +332,19 @@ async function refreshCore() {
       `${summary.settings.breakerReason ?? 'No reason recorded'}. ` +
       'Check in Facebook that the account is not restricted before clearing it.';
   }
+
+  state.ig.settings = igSettings;
+  // Instagram's breaker is its own: a Facebook block does not stop Instagram,
+  // and the banners must not be confused for one another.
+  const igBar = document.getElementById('ig-breaker');
+  igBar.hidden = !igSettings.breakerTripped;
+  if (igSettings.breakerTripped) {
+    document.getElementById('ig-breaker-reason').textContent =
+      `${igSettings.breakerReason ?? 'No reason recorded'}. ` +
+      'Check in Instagram that the account is not restricted before clearing it.';
+  }
+  const waiting = (igCounts.new ?? 0) + (igCounts.followed ?? 0);
+  document.getElementById('c-ig-leads').textContent = waiting || '';
 }
 
 /** Groups do not carry their assignments, so fold them in for display. */
@@ -391,6 +407,16 @@ const variantLabel = (variantId) => {
   return `#${variantId}`;
 };
 const activeVariants = (ad) => (ad.variants ?? []).filter((v) => v.active);
+
+document.getElementById('clear-ig-breaker').onclick = async () => {
+  const ok = await confirmDialog('Clear the Instagram breaker?',
+    'Only do this once you have looked at the account in Instagram and it is behaving normally. '
+    + 'Clearing it and carrying on through a real restriction is how a temporary block becomes permanent.',
+    'Clear breaker', 'danger');
+  if (!ok) return;
+  try { await post('/api/ig/settings/clear-breaker', {}); await refreshCore(); await render(); flash('Instagram breaker cleared.', 'ok'); }
+  catch (err) { showError(err); }
+};
 
 document.getElementById('clear-breaker').onclick = async () => {
   const ok = await confirmDialog('Clear the circuit breaker?',
@@ -2038,9 +2064,682 @@ async function viewRounds() {
 
 // ---------------------------------------------------------------- routing ---
 
+// ------------------------------------------------------------- instagram ---
+/**
+ * The Instagram screens: Campaigns, Leads, IG Safety.
+ *
+ * Kept apart from the Facebook screens above because the two modules share
+ * nothing but this shell — different tables, different breaker, its own
+ * browser profile. The one place they meet is the job console, which is
+ * app-wide: Instagram runs in its own lane, so an IG harvest and a Facebook
+ * round can be going at once and both show up there.
+ */
+
+const IG_STATUS_LABELS = {
+  new: 'Not yet followed',
+  followed: 'Followed, waiting',
+  messaged: 'Messaged',
+  replied: 'Replied',
+  skipped: 'Skipped',
+  opted_out: 'Opted out',
+  failed: 'Failed',
+};
+
+const IG_STATUS_KINDS = {
+  new: '', followed: 'accent', messaged: 'ok', replied: 'ok',
+  skipped: 'dim', opted_out: 'warn', failed: 'bad',
+};
+
+/** Which campaign the Leads screen is filtered to; null = all of them. */
+let igLeadFilter = { campaignId: null, status: null };
+const igSelected = new Set();
+
+const igCampaignName = (id) => state.ig.campaigns.find((c) => c.id === id)?.name ?? `#${id}`;
+
+/** The handful of filter settings, as one readable line. */
+function igFilterSummary(f) {
+  const parts = [];
+  if (f.skipPrivate) parts.push('no private accounts');
+  if (f.skipBusiness) parts.push('no businesses');
+  if (f.minFollowers !== null) parts.push(`${f.minFollowers}+ followers`);
+  if (f.maxFollowers !== null) parts.push(`under ${f.maxFollowers} followers`);
+  if (f.maxFollowing !== null) parts.push(`follows under ${f.maxFollowing}`);
+  if (f.requireBioKeywords.length) parts.push(`bio mentions ${f.requireBioKeywords.join(' or ')}`);
+  if (f.excludeBioKeywords.length) parts.push(`bio avoids ${f.excludeBioKeywords.join(', ')}`);
+  return parts.length ? parts.join(' · ') : 'no profile filters';
+}
+
+/** New or edit, in one dialog. Returns true when something was saved. */
+async function igCampaignDialog(existing) {
+  const c = existing ?? {
+    name: '', active: true, sources: [], postsPerSource: 1, maxLeadsPerPost: 50,
+    harvestLikers: true, harvestCommenters: true, dmDelayMinHours: 24, dmDelayMaxHours: 48,
+    filters: {
+      skipPrivate: false, skipBusiness: true, minFollowers: null, maxFollowers: 5000,
+      maxFollowing: 3000, requireBioKeywords: [], excludeBioKeywords: [],
+    },
+  };
+
+  const name = el('input', { type: 'text', value: c.name, placeholder: 'Paarl coffee shops' });
+  const sources = el('textarea', {
+    rows: 4,
+    placeholder: '@cafeone\n@thelocalbakery',
+    value: c.sources.map((s) => `@${s}`).join('\n'),
+  });
+  const postsPerSource = el('input', { type: 'number', min: 1, max: 12, value: c.postsPerSource });
+  const maxLeadsPerPost = el('input', { type: 'number', min: 1, max: 500, value: c.maxLeadsPerPost });
+  const likers = el('input', { type: 'checkbox', checked: c.harvestLikers });
+  const commenters = el('input', { type: 'checkbox', checked: c.harvestCommenters });
+  const dmMin = el('input', { type: 'number', min: 0, max: 336, value: c.dmDelayMinHours });
+  const dmMax = el('input', { type: 'number', min: 0, max: 336, value: c.dmDelayMaxHours });
+
+  const skipPrivate = el('input', { type: 'checkbox', checked: c.filters.skipPrivate });
+  const skipBusiness = el('input', { type: 'checkbox', checked: c.filters.skipBusiness });
+  const minFollowers = el('input', { type: 'number', min: 0, value: c.filters.minFollowers ?? '' });
+  const maxFollowers = el('input', { type: 'number', min: 0, value: c.filters.maxFollowers ?? '' });
+  const maxFollowing = el('input', { type: 'number', min: 0, value: c.filters.maxFollowing ?? '' });
+  const requireBio = el('input', { type: 'text', value: c.filters.requireBioKeywords.join(', ') });
+  const excludeBio = el('input', { type: 'text', value: c.filters.excludeBioKeywords.join(', ') });
+
+  const err = el('div', { class: 'err', hidden: true });
+  const numOrNull = (input) => (input.value.trim() === '' ? null : Number(input.value));
+  const words = (input) => input.value.split(',').map((w) => w.trim()).filter(Boolean);
+
+  const body = el('div', { class: 'stack' },
+    field('Campaign name', name),
+    field('Source accounts — the local businesses whose followers you want', sources,
+      'One handle per line. These are the accounts whose posts get read; they are never messaged.'),
+    el('div', { class: 'grid2' },
+      field('Newest posts per source', postsPerSource),
+      field('Most leads per post', maxLeadsPerPost)),
+    el('div', { class: 'grid2' },
+      field('Collect', el('label', { class: 'check' }, likers, el('span', {}, 'People who liked it'))),
+      field(' ', el('label', { class: 'check' }, commenters, el('span', {}, 'People who commented')))),
+    card('When the message goes out', { sub: 'After the follow, unless they follow back sooner' },
+      el('div', { class: 'grid2' },
+        field('At least (hours)', dmMin),
+        field('At most (hours)', dmMax)),
+      el('div', { class: 'note' },
+        'A follow-back pulls it forward, which is the whole point of following first: '
+        + 'a message from someone you just followed is not a cold DM.')),
+    card('Who to skip', { sub: 'Checked on the profile, just before following' },
+      el('div', { class: 'grid2' },
+        field('Private accounts', el('label', { class: 'check' }, skipPrivate, el('span', {}, 'Skip them'))),
+        field('Business accounts', el('label', { class: 'check' }, skipBusiness, el('span', {}, 'Skip them')))),
+      el('div', { class: 'grid2' },
+        field('Fewest followers', minFollowers, 'Blank for no limit'),
+        field('Most followers', maxFollowers, 'Blank for no limit')),
+      field('Skip if they follow more than', maxFollowing,
+        'Accounts following thousands are rarely local customers. Blank for no limit.'),
+      field('Bio must mention one of', requireBio, 'Comma separated. Blank for no requirement.'),
+      field('Skip if the bio mentions', excludeBio, 'Comma separated.')),
+    err,
+  );
+
+  const payload = () => ({
+    name: name.value.trim(),
+    active: c.active,
+    sources: sources.value.split(/[\s,]+/).map((s) => s.trim().replace(/^@/, '')).filter(Boolean),
+    postsPerSource: Number(postsPerSource.value),
+    maxLeadsPerPost: Number(maxLeadsPerPost.value),
+    harvestLikers: likers.checked,
+    harvestCommenters: commenters.checked,
+    dmDelayMinHours: Number(dmMin.value),
+    dmDelayMaxHours: Number(dmMax.value),
+    filters: {
+      skipPrivate: skipPrivate.checked,
+      skipBusiness: skipBusiness.checked,
+      minFollowers: numOrNull(minFollowers),
+      maxFollowers: numOrNull(maxFollowers),
+      maxFollowing: numOrNull(maxFollowing),
+      requireBioKeywords: words(requireBio),
+      excludeBioKeywords: words(excludeBio),
+    },
+  });
+
+  const saved = await dialog({
+    title: existing ? `Edit ${c.name}` : 'New campaign',
+    wide: true,
+    body,
+    actions: [
+      { label: 'Cancel', value: null },
+      {
+        label: existing ? 'Save' : 'Create campaign',
+        value: true,
+        submit: true,
+        run: async () => {
+          const p = payload();
+          const show = (msg) => { err.hidden = false; err.textContent = msg; return false; };
+          if (!p.name) return show('Give the campaign a name.');
+          if (p.sources.length === 0) return show('Add at least one source account.');
+          if (!p.harvestLikers && !p.harvestCommenters) {
+            return show('Collect likers, commenters, or both — otherwise there is nothing to collect.');
+          }
+          if (p.dmDelayMinHours > p.dmDelayMaxHours) return show('The earliest time must not be after the latest.');
+          try {
+            if (existing) await patch(`/api/ig/campaigns/${existing.id}`, p);
+            else await post('/api/ig/campaigns', p);
+            return true;
+          } catch (e) {
+            return show(e.message);
+          }
+        },
+      },
+    ],
+  });
+  return !!saved;
+}
+
+/** Manage one campaign's message variants. */
+async function igMessagesDialog(campaign) {
+  const listHost = el('div', { class: 'stack' });
+
+  const draw = async () => {
+    const variants = await get(`/api/ig/variants?campaignId=${campaign.id}`);
+    listHost.replaceChildren(...(variants.length
+      ? variants.map((v) => el('div', { class: 'row-item' },
+        el('div', { class: 'grow' },
+          el('div', { class: 'row small' },
+            el('span', { class: `pill ${v.active ? 'ok' : 'dim'}` }, v.active ? 'in use' : 'off'),
+            el('span', { class: 'muted' }, `weight ${v.weight}`)),
+          el('p', { class: 'pre' }, v.text)),
+        el('div', { class: 'row' },
+          toggle(v.active, async (on) => { await patch(`/api/ig/variants/${v.id}`, { active: on }); await draw(); }),
+          btn('', async () => {
+            const text = await igMessageTextDialog(v.text);
+            if (text === null) return;
+            await patch(`/api/ig/variants/${v.id}`, { text });
+            await draw();
+          }, { icon: 'edit', kind: 'ghost', size: 'sm', title: 'Edit the wording' }),
+          btn('', async () => {
+            if (!await confirmDialog('Delete this message?', 'Leads already sent it keep their history.', 'Delete', 'danger')) return;
+            await api('DELETE', `/api/ig/variants/${v.id}`);
+            await draw();
+          }, { icon: 'trash', kind: 'ghost', size: 'sm', title: 'Delete' }))))
+      : [empty('send', 'No messages yet',
+        'A campaign with no message can follow people but never writes to them.')]));
+  };
+  await draw();
+
+  await dialog({
+    title: `Messages — ${campaign.name}`,
+    text: 'Several wordings, rotated, so the same text does not go to person after person. '
+      + 'Use {first_name} and {username}; a missing first name is dropped cleanly.',
+    wide: true,
+    body: el('div', { class: 'stack' },
+      listHost,
+      callout('info', 'No links in the first message.',
+        'A first message with a link in it is the most reported kind. Send the link when they reply.'),
+      btn('Add a message', async () => {
+        const text = await igMessageTextDialog('');
+        if (text === null) return;
+        await post('/api/ig/variants', { campaignId: campaign.id, text });
+        await draw();
+      }, { icon: 'plus', kind: 'secondary', size: 'sm' })),
+    actions: [{ label: 'Done', value: true }],
+  });
+}
+
+/** The wording of one message, with a live preview of how it renders. */
+async function igMessageTextDialog(value) {
+  const input = el('textarea', {
+    rows: 5, value,
+    placeholder: 'Hi {first_name}, saw you at the market on Saturday — we roast a few streets away '
+      + 'and wondered if you fancied a free bag to try?',
+  });
+  const preview = el('p', { class: 'pre muted' });
+  const err = el('div', { class: 'err', hidden: true });
+
+  const render = () => {
+    // The same rule the server applies: an empty first name takes the space
+    // or comma before it with it.
+    preview.textContent = input.value
+      .replace(/\{username\}/gi, 'thandi.m')
+      .replace(/\{first_name\}/gi, 'Thandi')
+      .trim() || 'The message will be previewed here.';
+  };
+  input.oninput = render;
+  render();
+
+  const ok = await dialog({
+    title: 'Message wording',
+    wide: true,
+    body: el('div', { class: 'stack' },
+      field('What they receive', input),
+      card('Preview, for someone called Thandi M', {}, preview),
+      err),
+    actions: [
+      { label: 'Cancel', value: null },
+      {
+        label: 'Save',
+        value: true,
+        submit: true,
+        run: () => {
+          const text = input.value.trim();
+          if (!text) { err.hidden = false; err.textContent = 'Write the message first.'; return false; }
+          const unknown = [...text.matchAll(/\{(\w+)\}/g)]
+            .map((m) => m[1].toLowerCase())
+            .filter((p) => p !== 'first_name' && p !== 'username');
+          if (unknown.length) {
+            err.hidden = false;
+            err.textContent = `Unknown placeholder(s): ${[...new Set(unknown)].map((p) => `{${p}}`).join(', ')}.`
+              + ' Only {first_name} and {username} are filled in.';
+            return false;
+          }
+          return true;
+        },
+      },
+    ],
+  });
+  return ok ? input.value.trim() : null;
+}
+
+/** The dry run, shown as the list of what would happen and when. */
+async function igShowPlan() {
+  const plan = await get('/api/ig/plan');
+  await dialog({
+    title: 'Dry run',
+    text: 'Exactly what a run would do next, without doing any of it.',
+    wide: true,
+    body: el('div', { class: 'stack' },
+      ...plan.warnings.map((w) => callout('warn', null, w)),
+      plan.steps.length === 0
+        ? empty('calendar', 'Nothing would happen', plan.stopReason)
+        : el('table', { class: 'table' },
+          el('thead', {}, el('tr', {},
+            el('th', {}, 'When'), el('th', {}, 'What'), el('th', {}, 'Who'), el('th', {}, 'Campaign'))),
+          el('tbody', {}, ...plan.steps.map((s) => el('tr', {},
+            el('td', {}, fmtClock(s.at)),
+            el('td', {}, el('span', { class: `pill ${s.kind === 'dm' ? 'ok' : 'accent'}` },
+              s.kind === 'dm' ? 'message' : 'follow')),
+            el('td', {}, el('a', {
+              href: `https://www.instagram.com/${s.username}/`, target: '_blank', rel: 'noreferrer',
+            }, `@${s.username}`)),
+            el('td', { class: 'muted' }, igCampaignName(s.campaignId)))))),
+      plan.steps.length
+        ? el('div', { class: 'note' },
+          `Stops after that: ${plan.stopReason}. `
+          + `${plan.remaining.follows} follow(s) and ${plan.remaining.dms} message(s) left in today's caps.`)
+        : null),
+    actions: [{ label: 'Close', value: true }],
+  });
+}
+
+async function viewIgCampaigns() {
+  const [campaigns, jobs] = await Promise.all([get('/api/ig/campaigns'), fetchRunningJobs()]);
+  state.ig.campaigns = campaigns;
+  if (jobs.length) startPolling();
+
+  const s = state.ig.settings;
+  const busy = jobs.some((j) => j.lane === 'instagram');
+  const blocked = s.breakerTripped;
+  const variantCounts = await Promise.all(campaigns.map((c) => get(`/api/ig/variants?campaignId=${c.id}`)));
+
+  mount(
+    pageHead('Instagram campaigns',
+      'Point a campaign at local businesses, collect the people who engage with their posts, '
+      + 'follow them, and write once — slowly, and only within the caps.',
+      btn('New campaign', async () => { if (await igCampaignDialog(null)) await render(); },
+        { icon: 'plus', kind: 'primary' })),
+
+
+    card('Run', { sub: busy ? 'An Instagram job is already running' : 'One Instagram job at a time' },
+      el('div', { class: 'row wrap' },
+        btn('Collect leads', () => startJob('/api/ig/jobs/harvest', {}),
+          { icon: 'search', kind: 'secondary', disabled: busy || blocked, title: 'Reads posts only. Follows nobody, sends nothing.' }),
+        btn('Check replies', () => startJob('/api/ig/jobs/check', {}),
+          { icon: 'rotate', kind: 'secondary', disabled: busy || blocked, title: 'Reads your followers and inbox.' }),
+        btn('Dry run', igShowPlan, { icon: 'eye', kind: 'ghost' }),
+        btn(s.mode === 'auto' ? 'Run (auto)' : 'Run (you approve each one)',
+          async () => {
+            const ok = await confirmDialog(
+              s.mode === 'auto' ? 'Start an auto run?' : 'Start a run?',
+              s.mode === 'auto'
+                ? 'Follows and messages will go out without asking, up to today’s caps.'
+                : 'You will be asked before every follow, and you send each message yourself.',
+              'Start', s.mode === 'auto' ? 'danger' : '');
+            if (ok) await startJob('/api/ig/jobs/run', {});
+          },
+          { icon: 'play', kind: s.mode === 'auto' ? 'danger' : 'primary', disabled: busy || blocked })),
+      el('div', { class: 'note' },
+        'Collecting is the safe one: it reads posts and writes nobody. Run it first after any '
+        + 'change to Instagram’s pages, to see whether the selectors still work.')),
+
+    campaigns.length === 0
+      ? card(null, {}, empty('megaphone', 'No campaigns yet',
+        'A campaign is a list of local businesses whose customers you would like to reach.',
+        btn('New campaign', async () => { if (await igCampaignDialog(null)) await render(); }, { icon: 'plus', kind: 'primary' })))
+      : el('div', { class: 'stack' }, ...campaigns.map((c, i) => card(c.name, {
+        sub: `${plural(c.sources.length, 'source')} · ${plural(variantCounts[i].filter((v) => v.active).length, 'message')}`,
+        actions: [
+          toggle(c.active, async (on) => { await patch(`/api/ig/campaigns/${c.id}`, { active: on }); await render(); }),
+          btn('Messages', () => igMessagesDialog(c).then(render), { icon: 'send', kind: 'ghost', size: 'sm' }),
+          btn('Edit', async () => { if (await igCampaignDialog(c)) await render(); }, { icon: 'edit', kind: 'ghost', size: 'sm' }),
+          btn('', async () => {
+            if (!await confirmDialog(`Delete ${c.name}?`,
+              'Only possible while it has no leads — the leads are also the record of who has been contacted.',
+              'Delete', 'danger')) return;
+            try { await api('DELETE', `/api/ig/campaigns/${c.id}`); await render(); flash('Campaign deleted.', 'ok'); }
+            catch (e) { showError(e); }
+          }, { icon: 'trash', kind: 'ghost', size: 'sm', title: 'Delete' }),
+        ],
+      },
+      el('div', { class: 'row wrap small' }, ...c.sources.map((h) => el('a', {
+        class: 'tag', href: `https://www.instagram.com/${h}/`, target: '_blank', rel: 'noreferrer',
+      }, `@${h}`))),
+      el('div', { class: 'note' },
+        `Reads the newest ${plural(c.postsPerSource, 'post')} from each, up to ${c.maxLeadsPerPost} leads per post. `
+        + `Collects ${[c.harvestLikers ? 'likers' : null, c.harvestCommenters ? 'commenters' : null].filter(Boolean).join(' and ')}. `
+        + `Messages ${c.dmDelayMinHours}–${c.dmDelayMaxHours}h after following, sooner on a follow-back.`),
+      el('div', { class: 'note' }, igFilterSummary(c.filters)),
+      variantCounts[i].filter((v) => v.active).length === 0
+        ? callout('warn', 'No message yet.', 'Leads will be followed but never written to.')
+        : null))),
+
+    activityCard(jobs),
+  );
+}
+
+async function viewIgLeads() {
+  const [campaigns, counts] = await Promise.all([get('/api/ig/campaigns'), get('/api/ig/leads/counts')]);
+  state.ig.campaigns = campaigns;
+
+  const q = new URLSearchParams();
+  if (igLeadFilter.campaignId) q.set('campaignId', igLeadFilter.campaignId);
+  if (igLeadFilter.status) q.set('status', igLeadFilter.status);
+  const leads = await get(`/api/ig/leads?${q}`);
+
+  const statuses = Object.keys(IG_STATUS_LABELS);
+  const total = statuses.reduce((n, k) => n + (counts[k] ?? 0), 0);
+
+  const selectable = leads.filter((l) => l.status === 'new').map((l) => l.id);
+  for (const id of [...igSelected]) if (!selectable.includes(id)) igSelected.delete(id);
+
+  const bulkBar = el('div', { class: 'row wrap' },
+    el('span', { class: 'muted small' }, `${plural(igSelected.size, 'lead')} selected`),
+    btn('Skip them', async () => {
+      const reason = await promptDialog('Skip these leads', 'Why? (kept on the record)', 'not a fit');
+      if (reason === null) return;
+      const res = await post('/api/ig/leads/skip', { ids: [...igSelected], reason });
+      igSelected.clear();
+      flash(`${plural(res.skipped, 'lead')} skipped.`, 'ok');
+      await render();
+    }, { icon: 'x', kind: 'danger-outline', size: 'sm', disabled: igSelected.size === 0 }));
+
+  mount(
+    pageHead('Instagram leads',
+      'Everyone collected, and where they are up to. A username appears here once ever — '
+      + 'this list is also the record of who has already been approached.'),
+
+    card('By status', { sub: `${plural(total, 'lead')} in all` },
+      el('div', { class: 'row wrap' },
+        btn(`All (${total})`, async () => { igLeadFilter.status = null; await render(); },
+          { kind: igLeadFilter.status === null ? 'primary' : 'ghost', size: 'sm' }),
+        ...statuses.map((k) => btn(`${IG_STATUS_LABELS[k]} (${counts[k] ?? 0})`,
+          async () => { igLeadFilter.status = k; await render(); },
+          { kind: igLeadFilter.status === k ? 'primary' : 'ghost', size: 'sm' }))),
+      campaigns.length > 1
+        ? field('Campaign', select(igLeadFilter.campaignId ?? '', [
+          ['', 'All campaigns'],
+          ...campaigns.map((c) => [c.id, c.name]),
+        ], async (v) => { igLeadFilter.campaignId = v === '' ? null : Number(v); await render(); }))
+        : null),
+
+    selectable.length ? card('Selected', { sub: 'Only leads nobody has contacted can be skipped' }, bulkBar) : null,
+
+    leads.length === 0
+      ? card(null, {}, empty('users', 'No leads here',
+        igLeadFilter.status
+          ? 'Nothing in this status yet.'
+          : 'Run "Collect leads" on the Campaigns screen to gather some.'))
+      : card(null, { flush: true }, el('table', { class: 'table' },
+        el('thead', {}, el('tr', {},
+          el('th', {}, selectable.length
+            ? el('input', {
+              type: 'checkbox',
+              checked: igSelected.size > 0 && igSelected.size === selectable.length,
+              onchange: async (e) => {
+                igSelected.clear();
+                if (e.target.checked) for (const id of selectable) igSelected.add(id);
+                await render();
+              },
+            })
+            : ''),
+          el('th', {}, 'Who'), el('th', {}, 'Status'), el('th', {}, 'Found on'),
+          el('th', {}, 'Next'), el('th', {}, ''))),
+        el('tbody', {}, ...leads.map((l) => el('tr', {},
+          el('td', {}, l.status === 'new'
+            ? el('input', {
+              type: 'checkbox',
+              checked: igSelected.has(l.id),
+              onchange: async (e) => {
+                if (e.target.checked) igSelected.add(l.id); else igSelected.delete(l.id);
+                await render();
+              },
+            })
+            : ''),
+          el('td', {},
+            el('a', {
+              href: `https://www.instagram.com/${l.username}/`, target: '_blank', rel: 'noreferrer',
+            }, `@${l.username}`),
+            l.displayName ? el('div', { class: 'muted small' }, l.displayName) : null),
+          el('td', {},
+            el('span', { class: `pill ${IG_STATUS_KINDS[l.status]}` }, IG_STATUS_LABELS[l.status]),
+            l.skipReason ? el('div', { class: 'muted small' }, l.skipReason) : null,
+            l.lastError ? el('div', { class: 'muted small' }, l.lastError) : null),
+          el('td', { class: 'muted small' },
+            el('div', {}, `@${l.sourceHandle}`),
+            el('div', {}, l.source === 'commenter' ? 'commented' : 'liked')),
+          el('td', { class: 'muted small' },
+            l.status === 'followed' && l.dmDueAt
+              ? `message ${relTime(l.dmDueAt)}${l.followedBackAt ? ' · followed back' : ''}`
+              : l.status === 'messaged' && l.messagedAt ? `written ${relTime(l.messagedAt)}`
+                : l.status === 'new' ? 'waiting to be followed' : ''),
+          el('td', {}, ['opted_out', 'replied'].includes(l.status) ? null : btn('', async () => {
+            if (!await confirmDialog(`Never contact @${l.username}?`,
+              'They stay on the list so no campaign can collect them again.', 'Never contact', 'danger')) return;
+            await post(`/api/ig/leads/${l.id}/opt-out`, {});
+            await render();
+          }, { icon: 'x', kind: 'ghost', size: 'sm', title: 'Never contact' }))))))),
+  );
+}
+
+async function viewIgSafety() {
+  const [settings, actions, jobs] = await Promise.all([
+    get('/api/ig/settings'), get('/api/ig/actions?limit=60'), fetchRunningJobs(),
+  ]);
+  state.ig.settings = settings;
+  if (jobs.length) startPolling();
+
+  const f = {};
+  const errs = {};
+  const bar = el('div', { class: 'savebar', hidden: true });
+
+  const num = (key, min, max) => {
+    const input = el('input', { type: 'number', value: settings[key] ?? '', min, max });
+    input.oninput = () => { validate(); sync(); };
+    errs[key] = el('div', { class: 'err', hidden: true });
+    f[key] = input;
+    return el('div', {}, input, errs[key]);
+  };
+  const fieldN = (label, key, min, max, note) => field(label, num(key, min, max), note);
+
+  f.timezone = el('input', { type: 'text', value: settings.timezone, oninput: () => { validate(); sync(); } });
+  errs.timezone = el('div', { class: 'err', hidden: true });
+  let mode = settings.mode;
+
+  const read = () => ({
+    dailyFollowCap: +f.dailyFollowCap.value,
+    dailyDmCap: +f.dailyDmCap.value,
+    dailyProfileVisitCap: +f.dailyProfileVisitCap.value,
+    minGapMinutes: +f.minGapMinutes.value,
+    maxGapMinutes: +f.maxGapMinutes.value,
+    activeHourStart: +f.activeHourStart.value,
+    activeHourEnd: +f.activeHourEnd.value,
+    timezone: f.timezone.value.trim(),
+    followBackDmMinMinutes: +f.followBackDmMinMinutes.value,
+    followBackDmMaxMinutes: +f.followBackDmMaxMinutes.value,
+    maxAttempts: +f.maxAttempts.value,
+    mode,
+  });
+
+  function validate() {
+    const v = read();
+    const problems = {};
+    const range = (k, lo, hi) => {
+      if (f[k].value === '' || !Number.isInteger(v[k]) || v[k] < lo || v[k] > hi) {
+        problems[k] = `Whole number from ${lo} to ${hi}`;
+      }
+    };
+    range('dailyFollowCap', 0, 200); range('dailyDmCap', 0, 200); range('dailyProfileVisitCap', 0, 1000);
+    range('minGapMinutes', 0, 240); range('maxGapMinutes', 0, 240);
+    range('activeHourStart', 0, 23); range('activeHourEnd', 1, 24);
+    range('followBackDmMinMinutes', 0, 1440); range('followBackDmMaxMinutes', 0, 1440);
+    range('maxAttempts', 1, 10);
+    if (!problems.minGapMinutes && !problems.maxGapMinutes && v.minGapMinutes > v.maxGapMinutes) {
+      problems.maxGapMinutes = 'Must be at least the minimum gap';
+    }
+    if (!problems.activeHourStart && !problems.activeHourEnd && v.activeHourStart >= v.activeHourEnd) {
+      problems.activeHourEnd = 'Must be after the start hour';
+    }
+    if (!problems.followBackDmMinMinutes && !problems.followBackDmMaxMinutes
+      && v.followBackDmMinMinutes > v.followBackDmMaxMinutes) {
+      problems.followBackDmMaxMinutes = 'Must be at least the minimum';
+    }
+    try { new Intl.DateTimeFormat('en', { timeZone: v.timezone }); }
+    catch { problems.timezone = 'Not a timezone — use a name like Africa/Johannesburg'; }
+
+    for (const [k, node] of Object.entries(errs)) {
+      node.hidden = !problems[k];
+      node.textContent = problems[k] ?? '';
+      f[k].classList.toggle('invalid', !!problems[k]);
+    }
+    return problems;
+  }
+
+  let original = null;
+  const dirty = () => original !== null && JSON.stringify(read()) !== original;
+  const sync = () => { bar.hidden = !dirty(); };
+
+  const save = async () => {
+    if (Object.keys(validate()).length > 0) { flash('Fix the highlighted values first.'); return; }
+    state.ig.settings = await patch('/api/ig/settings', read());
+    flash('Instagram safety settings saved.', 'ok');
+    await render();
+  };
+
+  bar.append(
+    el('span', { class: 'grow muted small' }, 'Unsaved changes'),
+    btn('Discard', () => render(), { kind: 'ghost', size: 'sm' }),
+    btn('Save', save, { kind: 'primary', size: 'sm', icon: 'check' }),
+  );
+
+  const modeRow = el('div', { class: 'row wrap' },
+    // Saved immediately rather than left as an unsaved edit: going back to
+    // approving each one is making things safer, and a re-render would
+    // otherwise discard the choice.
+    btn('You approve each one', async () => { if (mode !== 'assisted') { mode = 'assisted'; await save(); } },
+      { kind: mode === 'assisted' ? 'primary' : 'ghost', size: 'sm', icon: 'pointer' }),
+    btn('Automatic', async () => {
+      const ok = await confirmDialog('Switch Instagram to automatic?',
+        'Follows and messages will go out without you seeing them first. On the account your '
+        + 'customers know you by, this is the setting that costs the most if the wording is wrong.',
+        'Switch to automatic', 'danger');
+      if (!ok) return;
+      mode = 'auto';
+      await save();
+    }, { kind: mode === 'auto' ? 'danger' : 'ghost', size: 'sm', icon: 'zap' }));
+
+  mount(
+    pageHead('Instagram safety',
+      'The caps and the pacing are the product here; the automation is secondary. '
+      + 'Raise them slowly, and only while nothing has pushed back.'),
+
+    settings.breakerTripped
+      ? callout('bad', 'Instagram pushed back — everything Instagram is stopped.',
+        `${settings.breakerReason ?? 'No reason recorded'}`
+        + `${settings.breakerTrippedAt ? ` (${relTime(settings.breakerTrippedAt)})` : ''}. `
+        + 'Open Instagram yourself and check the account is not restricted before clearing this.',
+        btn('Clear it', async () => {
+          const ok = await confirmDialog('Clear the Instagram breaker?',
+            'Only do this once you have looked at the account in Instagram and it is behaving normally. '
+            + 'Clearing it and carrying on through a real restriction is how a temporary block becomes permanent.',
+            'Clear breaker', 'danger');
+          if (!ok) return;
+          await post('/api/ig/settings/clear-breaker', {});
+          flash('Instagram breaker cleared.', 'ok');
+          await render();
+        }, { kind: 'danger', size: 'sm' }))
+      : callout('ok', 'Nothing has pushed back.',
+        'Instagram stops everything the moment it sees "action blocked", a challenge, or a rate limit.'),
+
+    card('How much, per day', { sub: 'Counted across every campaign, in your timezone' },
+      el('div', { class: 'grid3' },
+        fieldN('Follows', 'dailyFollowCap', 0, 200, 'Default 25'),
+        fieldN('Messages', 'dailyDmCap', 0, 200, 'Default 12'),
+        fieldN('Profile visits', 'dailyProfileVisitCap', 0, 1000, 'Default 80')),
+      el('div', { class: 'note' },
+        'Every follow costs a profile visit too — the filters are checked on the profile. '
+        + 'A follow that failed still counts: the click reached Instagram.')),
+
+    card('How fast', { sub: 'Random, within the range, between every action' },
+      el('div', { class: 'grid2' },
+        fieldN('Shortest gap (minutes)', 'minGapMinutes', 0, 240),
+        fieldN('Longest gap (minutes)', 'maxGapMinutes', 0, 240)),
+      el('div', { class: 'grid2' },
+        fieldN('Active from (hour)', 'activeHourStart', 0, 23),
+        fieldN('Active until (hour)', 'activeHourEnd', 1, 24)),
+      field('Timezone', el('div', {}, f.timezone, errs.timezone)),
+      el('div', { class: 'note' },
+        'A run waits out these gaps, so it takes hours. That is the point: twenty follows in '
+        + 'two minutes is the pattern that gets noticed.')),
+
+    card('After a follow-back', { sub: 'How soon the message follows' },
+      el('div', { class: 'grid2' },
+        fieldN('At least (minutes)', 'followBackDmMinMinutes', 0, 1440),
+        fieldN('At most (minutes)', 'followBackDmMaxMinutes', 0, 1440)),
+      el('div', { class: 'note' },
+        'Someone who followed back has seen you and acted, so the message is no longer cold. '
+        + 'Without a follow-back it waits the campaign’s full delay.')),
+
+    card('Giving up', {}, field('Attempts before a lead is left alone',
+      num('maxAttempts', 1, 10), 'So one broken profile cannot eat the day.')),
+
+    card('Mode', { sub: mode === 'auto' ? 'Messages go out without you seeing them' : 'You approve every action' },
+      modeRow,
+      mode === 'auto'
+        ? callout('warn', 'Automatic, on your main business account.',
+          'Nothing is sent unless it can be confirmed in the thread afterwards — but nobody reads it first.')
+        : null),
+
+    card('Recent Instagram activity', { sub: 'What actually reached Instagram' },
+      actions.length === 0
+        ? empty('list', 'Nothing yet', 'Actions appear here as soon as a job runs.')
+        : el('table', { class: 'table' },
+          el('thead', {}, el('tr', {},
+            el('th', {}, 'When'), el('th', {}, 'What'), el('th', {}, 'How it went'), el('th', {}, 'Detail'))),
+          el('tbody', {}, ...actions.map((a) => el('tr', {},
+            el('td', { class: 'muted small' }, fmtTime(a.at)),
+            el('td', {}, a.kind.replace('_', ' ')),
+            el('td', {}, el('span', {
+              class: `pill ${{ ok: 'ok', skipped: 'dim', failed: 'bad', blocked: 'bad' }[a.outcome]}`,
+            }, a.outcome)),
+            el('td', { class: 'muted small' }, a.detail ?? '')))))),
+
+    activityCard(jobs),
+    bar,
+  );
+
+  original = JSON.stringify(read());
+  validate();
+  sync();
+}
+
+
 const VIEWS = {
   dashboard: viewDashboard, setup: viewSetup, groups: viewGroups,
   ads: viewAds, plan: viewPlan, rounds: viewRounds, queue: viewQueue, settings: viewSettings,
+  'ig-campaigns': viewIgCampaigns, 'ig-leads': viewIgLeads, 'ig-safety': viewIgSafety,
 };
 let current = 'dashboard';
 
