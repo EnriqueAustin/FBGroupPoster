@@ -19,6 +19,7 @@
  */
 import type { Plan, PlanExclusion, PlannedPost, Scheduler, Store } from '../domain/contracts.ts';
 import type { Ad, Business, Group, Id, QueueItem } from '../domain/types.ts';
+import { membershipBlock } from './membership.ts';
 import { mulberry32, weightedPick, type Rng } from './rng.ts';
 import {
   MS_PER_DAY, MS_PER_MINUTE, dayBoundsUtcMs, dayKeyInZone,
@@ -123,6 +124,8 @@ export function createScheduler(store: Store): Scheduler {
         // An ad with no active variants cannot be posted; treat it as absent.
         .filter((ad) => store.ads.variants(ad.id, { activeOnly: true }).length > 0);
 
+      const identity = store.identities.forBusiness(biz);
+
       for (const groupId of store.groups.assignments(biz.id)) {
         const group = store.groups.get(groupId);
         if (!group) continue;
@@ -135,6 +138,13 @@ export function createScheduler(store: Store): Scheduler {
           add('group-quarantined', group.quarantineReason ?? undefined);
           continue;
         }
+
+        // The business posts as one identity, and that identity has to be in
+        // the group. Cooldowns below stay per GROUP, not per identity: the
+        // same ad from your profile and your Page in one group is still the
+        // same person spamming it, as far as its admins are concerned.
+        const notMember = membershipBlock(store, groupId, identity, nowMs);
+        if (notMember) { add(notMember.reason, notMember.detail); continue; }
 
         const cooldownDays = group.cooldownDaysOverride ?? s.perGroupCooldownDays;
         const last = store.log.lastPostToGroup(groupId);

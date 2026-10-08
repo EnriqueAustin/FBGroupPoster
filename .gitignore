@@ -6,6 +6,7 @@ data/*.db-wal
 data/*.db-shm
 data/media/
 .browser-profile/
+.browser-profile-page-*/
 .env
 *.log
 data/backups/

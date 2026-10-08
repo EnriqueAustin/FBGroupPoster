@@ -29,7 +29,7 @@ test('re-import repairs a junk name and keeps curation', async () => {
     fbGroupId: '42', name: 'Cape Town Adverts', url: 'https://www.facebook.com/groups/42',
     memberCount: 900, composerTypeGuess: 'status',
   }]));
-  assert.deepEqual(res, { found: 1, created: 0, updated: 1 });
+  assert.deepEqual(res, { found: 1, created: 0, updated: 1, joined: 0, left: 0 });
   const g = store.groups.get(id)!;
   assert.equal(g.name, 'Cape Town Adverts');
   assert.equal(g.memberCount, 900);

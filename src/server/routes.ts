@@ -7,8 +7,9 @@ import { z } from 'zod';
 import { writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import type { Scheduler, Store } from '../domain/contracts.ts';
+import type { Identity } from '../domain/types.ts';
 import { badRequest, must, parseBody, parseOr400, parseParams, parseQuery, sendError } from './http.ts';
-import { createJobRunner } from './jobs.ts';
+import { createJobRunner, type JobHandle, type JobLane } from './jobs.ts';
 import { importGroups } from '../bootstrap.ts';
 import { createGroupDiscoverer } from '../runner/discover-groups.ts';
 import { createRunner } from '../runner/playwright-runner.ts';
@@ -26,6 +27,22 @@ const businessBody = z.object({
   name: z.string().min(1),
   active: z.boolean().default(true),
   dailyCapShare: z.number().min(0).max(1).nullable().default(null),
+  /** Who the business posts as. Null = the personal profile. */
+  identityId: z.number().int().positive().nullable().default(null),
+});
+
+/**
+ * A Page's address. Only facebook.com URLs: the runner navigates here and
+ * clicks "Switch now", so anything else is at best useless.
+ */
+const pageUrl = z.string().url().refine(
+  (u) => /^https:\/\/(www\.|m\.|web\.)?facebook\.com\/.+/i.test(u),
+  { message: 'must be the Page\'s facebook.com address, e.g. https://www.facebook.com/yourpage' },
+);
+
+const identityBody = z.object({
+  name: z.string().trim().min(1),
+  pageUrl,
 });
 
 const groupPatch = z.object({
@@ -125,18 +142,90 @@ export function registerRoutes(
   // --- businesses ------------------------------------------------------------
   app.get('/api/businesses', () => store.businesses.list());
 
-  app.post('/api/businesses', (req) => store.businesses.create(parseBody(businessBody, req)));
+  const checkIdentity = (identityId: number | null | undefined) => {
+    if (identityId !== null && identityId !== undefined) must(store.identities.get(identityId), 'identity');
+  };
+
+  app.post('/api/businesses', (req) => {
+    const body = parseBody(businessBody, req);
+    checkIdentity(body.identityId);
+    return store.businesses.create(body);
+  });
 
   app.patch('/api/businesses/:id', (req) => {
     const { id } = parseParams(idParam, req);
     must(store.businesses.get(id), 'business');
-    return store.businesses.update(id, parseBody(businessBody.partial(), req));
+    const body = parseBody(businessBody.partial(), req);
+    checkIdentity(body.identityId);
+    return store.businesses.update(id, body);
+  });
+
+  // --- identities: the profile and the Pages it manages ----------------------
+  /**
+   * Each identity comes with how many groups it is an active member of, so
+   * the UI can say "Page X — 0 groups, import them" without a second call.
+   */
+  app.get('/api/identities', () => store.identities.list().map((i) => ({
+    ...i,
+    groupCount: store.memberships.list({ identityId: i.id }).filter((m) => m.active).length,
+  })));
+
+  app.post('/api/identities', (req) => store.identities.createPage(parseBody(identityBody, req)));
+
+  app.patch('/api/identities/:id', (req) => {
+    const { id } = parseParams(idParam, req);
+    const existing = must(store.identities.get(id), 'identity');
+    const body = parseBody(identityBody.partial(), req);
+    if (existing.kind === 'profile' && body.pageUrl !== undefined) {
+      throw badRequest('the personal profile has no Page address');
+    }
+    // A new address may be a different Page: forget the learned id so the
+    // next switch learns it afresh instead of failing verification forever.
+    const changedUrl = body.pageUrl !== undefined && body.pageUrl !== existing.pageUrl;
+    return store.identities.update(id, changedUrl ? { ...body, fbPageId: null } : body);
+  });
+
+  app.delete('/api/identities/:id', (req) => {
+    const { id } = parseParams(idParam, req);
+    const existing = must(store.identities.get(id), 'identity');
+    if (existing.kind === 'profile') throw badRequest('the personal profile cannot be removed');
+    const moved = store.businesses.list().filter((b) => b.identityId === id).length;
+    store.identities.remove(id);
+    return { removed: id, businessesMovedToProfile: moved };
+  });
+
+  app.get('/api/memberships', (req) => {
+    const q = parseQuery(z.object({
+      identityId: z.coerce.number().int().positive().optional(),
+      groupId: z.coerce.number().int().positive().optional(),
+    }), req);
+    return store.memberships.list(q);
+  });
+
+  /**
+   * Correct a membership by hand — the import missed a group the Page is in,
+   * or the Page has left one. Also how one identity's quarantine is lifted.
+   */
+  app.put('/api/memberships', (req) => {
+    const body = parseBody(z.object({
+      groupId: z.number().int().positive(),
+      identityId: z.number().int().positive(),
+      active: z.boolean().optional(),
+      clearQuarantine: z.boolean().optional(),
+    }), req);
+    must(store.groups.get(body.groupId), 'group');
+    must(store.identities.get(body.identityId), 'identity');
+    return store.memberships.set(body.groupId, body.identityId, {
+      ...(body.active !== undefined ? { active: body.active } : {}),
+      ...(body.clearQuarantine ? { quarantinedUntil: null, quarantineReason: null } : {}),
+    });
   });
 
   // --- groups ----------------------------------------------------------------
   app.get('/api/groups', (req) => {
     const q = parseQuery(z.object({
       businessId: z.coerce.number().int().positive().optional(),
+      identityId: z.coerce.number().int().positive().optional(),
       activeOnly: z.coerce.boolean().optional(),
       composerType: composerType.optional(),
     }), req);
@@ -187,7 +276,10 @@ export function registerRoutes(
     for (const g of quarantined) {
       store.groups.update(g.id, { quarantinedUntil: null, quarantineReason: null });
     }
-    return { cleared: quarantined.length };
+    // Per-identity quarantines (a group that refused your Page) count too:
+    // from the Rounds screen they block a round exactly the same way.
+    const memberships = store.memberships.clearQuarantines();
+    return { cleared: quarantined.length + memberships };
   });
 
   app.get('/api/businesses/:id/assignments', (req) => {
@@ -411,7 +503,16 @@ export function registerRoutes(
 
   app.post('/api/rounds/commit', (req) => {
     const { businessId, adId, replaceExisting } = parseBody(roundBody, req);
-    if (replaceExisting) store.queue.clearRounds();
+    if (replaceExisting) {
+      // Only this business's identity's rounds, and never while a run as that
+      // identity is working through them — another identity's round may be
+      // running right now and is none of this commit's business.
+      const identity = store.identities.forBusiness(must(store.businesses.get(businessId), 'business'));
+      if (jobs.laneBusy(laneOf(identity).key)) {
+        throw badRequest(`a run as ${identity.name} is going — stop it before replacing its round`);
+      }
+      store.queue.clearRounds({ businessIds: businessIdsOf(identity) });
+    }
     const plan = planRound(store, { businessId, now: new Date().toISOString(), ...(adId ? { adId } : {}) });
     if (plan.posts.length === 0) {
       throw badRequest('no group is eligible for a round right now — see the exclusions in the dry run');
@@ -429,42 +530,63 @@ export function registerRoutes(
 
   app.get('/api/jobs', () => jobs.list().map((j) => ({ ...j, lines: j.lines.slice(-5) })));
   app.get('/api/jobs/current', () => jobs.current());
+  /** Every job still going — one per identity at most. */
+  app.get('/api/jobs/running', () => jobs.running());
   app.get('/api/jobs/:id', (req) => {
     const id = String((req.params as { id: string }).id);
     return must(jobs.get(id), 'job');
   });
 
-  app.post('/api/jobs/bootstrap', () =>
-    jobs.start('bootstrap', async (h) => {
-      h.log('Opening Chrome…');
-      const discoverer = createGroupDiscoverer({
-        log: h.log,
-        // Ask rather than detect. Facebook's two-factor screens differ by
-        // account, region and challenge type, so every attempt to recognise
-        // them automatically has been a guess that failed on the real one.
-        confirmSignIn: async () => (await h.ask(
-          'Sign in to Facebook in the Chrome window that just opened — including any '
-          + 'code or phone approval. The browser will stay open and nothing will happen '
-          + 'until you press continue.',
-          [
-            { value: 'ok', label: 'I am signed in — continue' },
-            { value: 'cancel', label: 'Cancel import' },
-          ],
-          { kind: 'sign-in' },
-        )) === 'ok',
-      });
-      return importGroups(store, discoverer, h.log);
-    }));
+  /**
+   * Each identity drives its own Chrome profile, so it is its own lane: a
+   * round as the Page and a round as the profile can run side by side, but
+   * not two jobs as the same identity.
+   */
+  const laneOf = (identity: Identity): JobLane => ({ key: `identity-${identity.id}`, label: identity.name });
+  const identityOr404 = (identityId: number | undefined): Identity =>
+    identityId === undefined ? store.identities.profile() : must(store.identities.get(identityId), 'identity');
+  const businessIdsOf = (identity: Identity) => store.businesses.list()
+    .filter((b) => store.identities.forBusiness(b).id === identity.id).map((b) => b.id);
 
-  app.post('/api/jobs/post-run', (req) => {
-    const { max } = parseBody(z.object({ max: z.number().int().min(1).max(100).default(5) }), req);
-    const s = store.settings.get();
-    if (s.breakerTripped) throw badRequest('the circuit breaker is tripped — clear it first');
+  /** Ask the human to switch identity by hand, through the UI. */
+  const askSwitchVia = (h: JobHandle) => async (identity: Identity) => (await h.ask(
+    `Couldn't switch the browser to ${identity.name} automatically. In the Chrome window, `
+    + `click your profile picture (top right) and choose ${identity.name}, then continue.`,
+    [
+      { value: 'ok', label: `I've switched to ${identity.name}` },
+      { value: 'cancel', label: 'Give up' },
+    ],
+    { kind: 'switch-identity', identity: identity.name, pageUrl: identity.pageUrl },
+  )) === 'ok';
 
-    return jobs.start('post-run', async (h) => {
-      const runner = createRunner({
-        log: h.log,
-        askHuman: (_prompt, context) => h.ask(
+  // Ask rather than detect. Facebook's two-factor screens differ by account,
+  // region and challenge type, so every attempt to recognise them
+  // automatically has been a guess that failed on the real one.
+  const askSignInVia = (h: JobHandle, identity: Identity, cancelLabel: string) => async () => (await h.ask(
+    `Sign in to Facebook in the Chrome window that just opened for ${identity.name} — including any `
+    + 'code or phone approval. The browser will stay open and nothing will happen '
+    + 'until you press continue.',
+    [
+      { value: 'ok', label: 'I am signed in — continue' },
+      { value: 'cancel', label: cancelLabel },
+    ],
+    { kind: 'sign-in', identity: identity.name },
+  )) === 'ok';
+
+  /**
+   * A posting run as one identity, in that identity's browser, touching only
+   * that identity's queue items. Stop (the button, or "Stop the run" at a
+   * post) ends this run only.
+   */
+  const postAs = (h: JobHandle, identity: Identity, max: number, waitForUpcomingMs = 0) => {
+    let stopAsked = false;
+    const runner = createRunner({
+      log: h.log,
+      identity,
+      askSwitch: askSwitchVia(h),
+      confirmSignIn: askSignInVia(h, identity, 'Cancel run'),
+      askHuman: async (_prompt, context) => {
+        const answer = await h.ask(
           'Ready to post — review it in the browser, then tell me what happened.',
           [
             { value: '', label: 'I posted it' },
@@ -472,11 +594,51 @@ export function registerRoutes(
             { value: 'q', label: 'Stop the run' },
           ],
           context,
-        ),
-      });
-      const orchestrator = createOrchestrator({ store, runner, log: h.log });
-      return orchestrator.runDue(max);
+        );
+        if (answer === 'q') stopAsked = true;
+        return answer;
+      },
     });
+    const orchestrator = createOrchestrator({
+      store, runner, log: h.log, identityId: identity.id,
+      isStopRequested: () => stopAsked || h.cancelled,
+    });
+    return orchestrator.runDue(max, waitForUpcomingMs);
+  };
+
+  app.post('/api/jobs/bootstrap', (req) => {
+    // A bodyless POST (the old button) means the personal profile.
+    const { identityId } = parseOr400(
+      z.object({ identityId: z.number().int().positive().optional() }), req.body ?? {}, 'body');
+    const identity = identityOr404(identityId);
+
+    return jobs.start('bootstrap', async (h) => {
+      h.log(`Opening Chrome to import the groups ${identity.name} has joined…`);
+      const discoverer = createGroupDiscoverer({
+        log: h.log,
+        identity,
+        askSwitch: askSwitchVia(h),
+        onLearnedFbPageId: (fbPageId) => store.identities.update(identity.id, { fbPageId }),
+        confirmSignIn: askSignInVia(h, identity, 'Cancel import'),
+      });
+      return importGroups(store, discoverer, h.log, identity.id);
+    }, laneOf(identity));
+  });
+
+  app.post('/api/jobs/post-run', (req) => {
+    const { max, identityId } = parseBody(z.object({
+      max: z.number().int().min(1).max(100).default(5),
+      /** Whose due posts to work through. Omitted = the personal profile's. */
+      identityId: z.number().int().positive().optional(),
+    }), req);
+    const identity = identityOr404(identityId);
+    const s = store.settings.get();
+    if (s.breakerTripped) throw badRequest('the circuit breaker is tripped — clear it first');
+
+    return jobs.start('post-run', async (h) => {
+      h.log(`Posting run as ${identity.name}.`);
+      return postAs(h, identity, max);
+    }, laneOf(identity));
   });
 
   /**
@@ -484,6 +646,9 @@ export function registerRoutes(
    * ad to all my groups now" button. One call rather than three because the
    * three-step version invites committing a round and forgetting to run it,
    * which then sits in the queue and fires at a time nobody chose.
+   *
+   * Runs in the lane of the business's identity, so a round for a business
+   * posting as its Page can go at the same time as one posting as the profile.
    */
   app.post('/api/jobs/post-round', (req) => {
     const { businessId, adId } = parseBody(
@@ -494,14 +659,21 @@ export function registerRoutes(
 
     const s = store.settings.get();
     if (s.breakerTripped) throw badRequest('the circuit breaker is tripped — clear it first');
-    // jobs.start() refuses a second concurrent job, but it is called AFTER the
+    const identity = store.identities.forBusiness(must(store.businesses.get(businessId), 'business'));
+    const lane = laneOf(identity);
+    // jobs.start() refuses a second job in a lane, but it is called AFTER the
     // round is committed. Checking here keeps a rejected start from leaving a
     // committed round in the queue that nobody asked to run.
-    if (jobs.current()) throw badRequest('another job is already running — stop it first');
+    if (jobs.laneBusy(lane.key)) {
+      throw badRequest(`a job as ${identity.name} is already running — stop it first, `
+        + 'or start this round from a business that posts as a different identity');
+    }
 
     // Plan before starting the job so an empty or impossible round is a plain
     // 400 the UI can show, not a job that starts and immediately gives up.
-    store.queue.clearRounds();
+    // Only this identity's stale rounds are cleared: another identity's round
+    // may be running right now.
+    store.queue.clearRounds({ businessIds: businessIdsOf(identity) });
     const plan = planRound(store, {
       businessId, now: new Date().toISOString(), ...(adId ? { adId } : {}),
     });
@@ -511,33 +683,20 @@ export function registerRoutes(
     const items = commitRound(store, plan);
 
     return jobs.start('post-run', async (h) => {
-      h.log(`Round ${plan.roundId}: ${items.length} group(s), ${s.defaultRunnerMode} mode.`);
+      h.log(`Round ${plan.roundId} as ${identity.name}: ${items.length} group(s), ${s.defaultRunnerMode} mode.`);
       if (plan.warning) h.log(`[warn] ${plan.warning}`);
       h.log(`Pacing: ${s.roundMinGapMinutes}-${s.roundMaxGapMinutes} min between posts. `
         + `Leave this window and the browser open — it finishes in roughly `
         + `${Math.round(items.length * (s.roundMinGapMinutes + s.roundMaxGapMinutes) / 2)} min.`);
       h.log('Between posts the run waits with the browser open; that is not a stall.');
 
-      const runner = createRunner({
-        log: h.log,
-        askHuman: (_prompt, context) => h.ask(
-          'Ready to post — review it in the browser, then tell me what happened.',
-          [
-            { value: '', label: 'I posted it' },
-            { value: 's', label: 'Skip this one' },
-            { value: 'q', label: 'Stop the run' },
-          ],
-          context,
-        ),
-      });
-      const orchestrator = createOrchestrator({ store, runner, log: h.log });
       // A round's posts are scheduled minutes apart, so the run has to WAIT for
       // them rather than stopping the moment nothing is due. The horizon is one
       // gap plus slack: long enough to reach the next post in this round, short
       // enough that a stray far-future item does not hold the browser open.
       const horizonMs = (s.roundMaxGapMinutes + 5) * 60_000;
-      return orchestrator.runDue(items.length, horizonMs);
-    });
+      return postAs(h, identity, items.length, horizonMs);
+    }, lane);
   });
 
   app.post('/api/jobs/:id/respond', (req) => {

@@ -72,6 +72,73 @@ group's round allowance, and vice versa.
 Active hours are advisory for a round rather than enforced: you trigger it by
 hand, and refusing at 21:05 would only be obstructive. It says so and proceeds.
 
+## Posting as a Page (identities)
+
+Each business posts as one **identity**: your personal profile (the default)
+or a Facebook Page that profile manages. Pages are added under Setup & Run →
+Posting identities, and picked per business with "Posts as" on the Ads screen.
+Ads and variants stay on the business, so nothing about them changes.
+
+Each identity has **its own Chrome profile** (`runner/browser.ts`,
+`profileDirFor`). The personal profile keeps `.browser-profile/`, and each Page
+gets `.browser-profile-page-<id>/`. The first import or run as a Page opens a
+signed-out window: sign in with your own account there, once. From then on that
+window stays switched into the Page. It is separate because "acting as a Page"
+covers the whole Facebook session. Two runs sharing one profile would keep
+switching each other between profile and Page in the middle of a post.
+
+To act as the Page, the runner switches that profile's session into it, the way
+you would by hand (the "Switch now" button on the Page). Facebook marks a
+switched session with an `i_user` cookie
+holding the Page's id, and `runner/identity.ts` uses only that cookie to
+confirm who it is acting as. If it cannot switch automatically it asks you to
+do it, then checks again. **If the switch cannot be confirmed, that post fails.
+It never goes out under the wrong name.**
+
+Groups are still one row per Facebook group, but **membership is per
+identity** (`group_memberships`):
+
+- A Page has to join each group itself, and many groups don't allow Pages. So
+  importing groups takes an identity: "Import groups" for a Page switches into
+  it and records only the groups it has joined. A group you and the Page are
+  both in stays one row, keeps its curation, and gains a second membership.
+  A group the Page no longer appears in is marked as left for the Page only.
+- The planner, rounds and run loop only use groups where the business's
+  identity is an active member (`scheduler/membership.ts`). Otherwise the plan
+  excludes the group as `not-a-member`.
+- If a group refuses a *Page* (`group-restricted`), only the Page's membership
+  there is quarantined. Your profile can still post in that group.
+
+What is deliberately **shared** across identities:
+
+- **Per-group cooldowns.** The same ad from your profile and from your Page in
+  one group is still one person posting twice, as far as the group's admins
+  can tell.
+- **The circuit breaker.** A Page is operated through your account, so an
+  account-wide block or checkpoint stops everything.
+- **The daily cap.**
+
+### Running as two identities at once
+
+Every job (import, posting run, round) runs in its identity's **lane**
+(`server/jobs.ts`). Jobs in different lanes run side by side, each in its own
+Chrome window. A second job in a busy lane is refused. So a round for a
+business that posts as the Page can run while a round as the profile is going.
+
+- A run takes only the queue items of businesses posting as its identity
+  (`createOrchestrator({ identityId })`). Starting a round clears only that
+  identity's stale round items, so the other round's queue is not touched.
+- The circuit breaker is re-read before every post. If one run hits a
+  checkpoint, the other stops at its next post.
+- A round leaves out a group that another identity's round still has queued.
+  That is the same per-group rest as above, applied before the other round's
+  post lands in the history. That round's queued posts also count towards the
+  daily round ceiling.
+- Stop, and "Stop the run" at a post, end only that run.
+
+Existing databases upgrade with every group as a profile membership and every
+business posting as the profile, so nothing changes until you pick a Page.
+
 ## Shape
 
 ```

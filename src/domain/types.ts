@@ -25,7 +25,63 @@ export interface Business {
   active: boolean;
   /** Optional per-business share of the global daily cap. Null = share evenly. */
   dailyCapShare: number | null;
+  /**
+   * Who this business posts as. Null = the personal profile, which is what
+   * every business did before identities existed, so an upgrade changes
+   * nothing until a Page is chosen.
+   */
+  identityId: Id | null;
   createdAt: IsoDateTime;
+}
+
+/**
+ * Who a post goes out as.
+ *
+ * There is exactly one 'profile' — the account signed in to the browser
+ * profile. 'page' identities are Facebook Pages that account manages; the
+ * runner switches the same session into the Page (Facebook's own profile
+ * switcher) before posting, so no second login is involved.
+ *
+ * This is not multi-account rotation: every identity is the same signed-in
+ * person, used openly, and they share one circuit breaker and one set of
+ * per-group cooldowns.
+ */
+export type IdentityKind = 'profile' | 'page';
+
+export interface Identity {
+  id: Id;
+  name: string;
+  kind: IdentityKind;
+  /** The Page's address, e.g. https://www.facebook.com/yourpage. Null for the profile. */
+  pageUrl: string | null;
+  /**
+   * The id Facebook uses for the Page while acting as it (the `i_user`
+   * cookie). Learned on the first successful switch, then used to verify
+   * every later one. Null for the profile, and for a Page never switched into.
+   */
+  fbPageId: string | null;
+  createdAt: IsoDateTime;
+}
+
+/**
+ * "This identity is a member of this group." Groups are shared across
+ * identities (one row per Facebook group), but membership is not: a Page has
+ * to join each group itself, and many groups do not allow Pages at all.
+ */
+export interface GroupMembership {
+  groupId: Id;
+  identityId: Id;
+  /** False once an import for this identity no longer finds the group. */
+  active: boolean;
+  /** When an import last saw this identity in the group. */
+  lastSeenAt: IsoDateTime | null;
+  /**
+   * Set when the group refused a post from THIS identity — typically a group
+   * that does not allow Pages. Kept off the group itself so a Page being
+   * refused never stops the personal profile posting there.
+   */
+  quarantinedUntil: IsoDateTime | null;
+  quarantineReason: string | null;
 }
 
 export interface Group {
@@ -172,6 +228,8 @@ export interface PostLog {
    * so it has to survive into the log rather than living only on the queue.
    */
   roundId: string | null;
+  /** Who it went out as. Null on rows written before identities existed. */
+  identityId: Id | null;
 }
 
 export interface Settings {
